@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.92"
 clap = { version = "4.5.20", features = ["derive"] }
+either = "1.13.0"
 http-body-util = "0.1.2"
 hyper = { version = "1.5", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

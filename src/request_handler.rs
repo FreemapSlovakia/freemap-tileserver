@@ -1,12 +1,12 @@
+use either::Either;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response, StatusCode,
 };
-use image::{codecs::jpeg::JpegDecoder, ImageDecoder, ImageError, Rgba, RgbaImage};
-use itertools::Itertools;
-use rusqlite::Connection;
-use std::{borrow::Cow, convert::Infallible};
+use image::{codecs::jpeg::JpegDecoder, ImageBuffer, ImageDecoder, ImageError, Rgba, RgbaImage};
+use rusqlite::{Connection, ToSql};
+use std::convert::Infallible;
 use std::{cell::RefCell, sync::Arc};
 use std::{io::Cursor, path::Path};
 use tokio::runtime::Runtime;
@@ -15,51 +15,6 @@ use url::Url;
 
 thread_local! {
     static THREAD_LOCAL_DATA: RefCell<Vec<(Box<str>, Connection)>> = const {RefCell::new(Vec::new())};
-}
-
-enum ImageType {
-    Jpeg,
-    // Png,
-    Webp,
-}
-
-pub enum Background {
-    Alpha,
-    Rgb(u8, u8, u8),
-}
-
-pub struct BackgroundError();
-
-impl TryFrom<Cow<'_, str>> for Background {
-    type Error = BackgroundError;
-
-    fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> {
-        if value.len() != 6 {
-            return Err(BackgroundError());
-        }
-
-        value
-            .chars()
-            .chunks(2)
-            .into_iter()
-            .map(Iterator::collect::<String>)
-            .map(|c| u8::from_str_radix(&c, 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|_| BackgroundError())
-            .map(|rgb| Self::Rgb(rgb[0], rgb[1], rgb[2]))
-    }
-}
-
-impl TryFrom<&str> for ImageType {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "jpg" | "jpeg" => Ok(Self::Jpeg),
-            "webp" => Ok(Self::Webp),
-            _ => Err(format!("unsupported extension {value}")),
-        }
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -78,6 +33,9 @@ enum ProcessingError {
 
     #[error("error reading tile: {0}")]
     ReadError2(#[from] rusqlite::Error),
+
+    #[error("jpeg encoding error: {0}")]
+    EncodingError(#[from] jpeg_encoder::EncodingError),
 }
 
 impl From<&rusqlite::Error> for ProcessingError {
@@ -108,47 +66,46 @@ pub async fn handle_request(
 
     let url = Url::parse(&format!("http://localhost{}", req.uri().to_string())).unwrap();
 
-    let path = url.path();
-
-    let mut quality = 75.0;
-
-    let mut background = Background::Alpha;
-
-    for pair in url.query_pairs() {
-        match pair.0.as_ref() {
-            "background" | "bg" => {
-                background = match pair.1.try_into() {
-                    Ok(bg) => bg,
-                    Err(_) => return http_error(StatusCode::BAD_REQUEST),
-                }
-            }
-            "quality" | "q" => {
-                quality = match pair.1.parse::<f32>() {
-                    Ok(quality) => quality,
-                    Err(_) => return http_error(StatusCode::BAD_REQUEST),
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let parts: Vec<_> = path.splitn(2, '.').collect();
-
-    let ext: Result<Option<ImageType>, _> = parts.get(1).map(|&x| x.try_into()).transpose();
-
-    let Ok(ext) = ext else {
-        return http_error(StatusCode::NOT_FOUND);
-    };
-
-    let parts: Vec<_> = parts
-        .get(0)
-        .copied()
-        .unwrap_or_default()
+    let parts: Vec<_> = url
+        .path()
         .get(1..)
         .unwrap_or_default()
         .splitn(3, '/')
         .map(|a| a.parse::<u32>().ok())
         .collect();
+
+    fn get_blobs<'a, T: ToSql>(
+        source: &str,
+        data: &'a mut Vec<(Box<str>, Connection)>,
+        zoom: T,
+        x: T,
+        y: T,
+    ) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let conn = if let Some(index) = data.iter().position(|a| a.0.as_ref() == source) {
+            &data[index].1
+        } else {
+            data.push((source.into(), Connection::open(source)?));
+            &data.last().unwrap().1
+        };
+
+        let mut stmt = conn.prepare(concat!(
+            "SELECT tile_data, tile_alpha ",
+            "FROM tiles ",
+            "WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3"
+        ))?;
+
+        let mut rows = stmt.query([zoom, x, y])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let tile_data = row.get::<_, Vec<u8>>(0)?;
+
+        let tile_alpha = row.get::<_, Vec<u8>>(1)?;
+
+        return Ok(Some((tile_data, tile_alpha)));
+    }
 
     match (
         parts.get(0).copied().flatten(),
@@ -158,55 +115,82 @@ pub async fn handle_request(
         (Some(zoom), Some(x), Some(y)) if parts.len() == 3 => pool
             .spawn_blocking(move || {
                 THREAD_LOCAL_DATA.with_borrow_mut(|data| {
-                    for source in sources {
-                        let conn = if let Some(conn) = data.iter().find(|a| a.0.as_ref() == source).map(|a| &a.1) { conn }
-                            else  {
-                                data.push((source.into(), Connection::open(source)?));
+                    let mut iter = sources.into_iter();
 
-                                &data.last().unwrap().1
-                            };
+                    let r1 = loop {
+                        let Some(source) = iter.next() else {
+                            break None;
+                        };
 
-                        let mut stmt = conn.prepare("SELECT tile_data, tile_alpha FROM tiles WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3")?;
+                        let Some((tile_data, tile_alpha)) = get_blobs(source, data, zoom, x, y)?
+                        else {
+                            continue;
+                        };
 
-                        let mut rows = stmt.query([zoom, x, y])?;
+                        break Some((tile_data, tile_alpha));
+                    };
 
-                        if let Some(row) = rows.next()? {
-                            let tile_data = row.get::<_, Vec<u8>>(0)?;
+                    let Some((tile_data, tile_alpha)) = r1 else {
+                        return Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None));
+                    };
 
-                            let tile_alpha = row.get::<_, Vec<u8>>(1)?;
+                    if tile_alpha.is_empty() {
+                        return Ok(Bytes::from(tile_data));
+                    }
 
-                            if tile_alpha.is_empty() {
-                                return Ok((ImageType::Jpeg, Bytes::from(tile_data)));
+                    let mut either: Either<Vec<u8>, ImageBuffer<Rgba<u8>, Vec<u8>>> =
+                        Either::Left(tile_data);
+
+                    while let Some(source) = iter.next() {
+                        let Some((tile_data2, tile_alpha2)) = get_blobs(source, data, zoom, x, y)?
+                        else {
+                            continue;
+                        };
+
+                        match &either {
+                            Either::Left(tile_data) => {
+                                let cursor = Cursor::new(tile_data);
+                                let decoder = JpegDecoder::new(cursor)?;
+
+                                let (w, h) = decoder.dimensions();
+
+                                let mut tile_data = vec![0; decoder.total_bytes() as usize];
+                                decoder.read_image(&mut tile_data)?;
+
+                                let mut rgba_img = RgbaImage::new(w, h);
+
+                                for (i, pixel) in rgba_img.pixels_mut().enumerate() {
+                                    let rgb_index = i * 3;
+
+                                    *pixel = Rgba([
+                                        tile_data[rgb_index],     // R
+                                        tile_data[rgb_index + 1], // G
+                                        tile_data[rgb_index + 2], // B
+                                        tile_alpha[i],            // A
+                                    ]);
+                                }
+
+                                either = Either::Right(rgba_img);
                             }
-
-                            let cursor = Cursor::new(tile_data);
-                            let decoder = JpegDecoder::new(cursor)?;
-
-                            let (w, h) = decoder.dimensions();
-
-                            let mut tile_data = vec![0; decoder.total_bytes() as usize];
-                            decoder.read_image(&mut tile_data)?;
-
-
-                            let mut rgba_img = RgbaImage::new(w, h);
-
-                            for (i, pixel) in rgba_img.pixels_mut().enumerate() {
-                                let rgb_index = i * 3;
-
-                                *pixel = Rgba([
-                                    tile_data[rgb_index],      // R
-                                    tile_data[rgb_index + 1],  // G
-                                    tile_data[rgb_index + 2],  // B
-                                    tile_alpha[i],             // A
-                                ]);
-                            }
-
-
-                            // image_buffer.
+                            Either::Right(_) => todo!("compose"),
                         }
                     }
 
-                    Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None))
+                    match either {
+                        Either::Left(tile_data) => Ok(Bytes::from(tile_data)),
+                        Either::Right(image_buffer) => {
+                            let mut out = vec![];
+
+                            jpeg_encoder::Encoder::new(&mut out, 90 /* TODO cfg */).encode(
+                                &image_buffer,
+                                image_buffer.width() as u16,
+                                image_buffer.height() as u16,
+                                jpeg_encoder::ColorType::Rgba, // ignores alpha
+                            )?;
+
+                            Ok(Bytes::from(out))
+                        }
+                    }
                 })
             })
             .await
@@ -222,18 +206,12 @@ pub async fn handle_request(
                         http_error(StatusCode::INTERNAL_SERVER_ERROR)
                     }
                 },
-                |message| {
+                |data| {
                     Response::builder()
                         .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            match message.0 {
-                                ImageType::Jpeg => "image/jpeg",
-                                ImageType::Webp => "image/webp",
-                            },
-                        )
+                        .header("Content-Type", "image/jpeg")
                         .header("Access-Control-Allow-Origin", "*")
-                        .body(Full::new(message.1).map_err(|e| match e {}).boxed())
+                        .body(Full::new(data).map_err(|e| match e {}).boxed())
                 },
             ),
         _ => http_error(StatusCode::NOT_FOUND),
