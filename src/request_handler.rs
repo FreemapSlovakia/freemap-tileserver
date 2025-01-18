@@ -1,11 +1,15 @@
-use either::Either;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response, StatusCode,
 };
-use image::{codecs::jpeg::JpegDecoder, ImageBuffer, ImageDecoder, ImageError, Rgba, RgbaImage};
-use rusqlite::{Connection, ToSql};
+use image::{codecs::jpeg::JpegDecoder, ImageDecoder, ImageError};
+use pix::{
+    ops::{DestOver, SrcOver},
+    rgb::{Rgba8, Rgba8p},
+    Raster,
+};
+use rusqlite::{Connection, OpenFlags, ToSql};
 use std::convert::Infallible;
 use std::{cell::RefCell, sync::Arc};
 use std::{io::Cursor, path::Path};
@@ -36,6 +40,9 @@ enum ProcessingError {
 
     #[error("jpeg encoding error: {0}")]
     EncodingError(#[from] jpeg_encoder::EncodingError),
+
+    #[error("io error: {0}")]
+    IoError(#[from] std::io::Error),
 }
 
 impl From<&rusqlite::Error> for ProcessingError {
@@ -50,14 +57,19 @@ pub enum BodyError {
     Infillable(Infallible),
 }
 
+enum Image {
+    Raw(Vec<u8>),
+    Raster(Raster<Rgba8p>),
+}
+
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
     raster_path: &'static Path,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
     let sources = vec![
-        "/home/martin/OSM/vychod.mbtiles",
-        "/home/martin/OSM/stred.mbtiles",
+        "/home/martin/OSM/stred-with-mask.mbtiles",
+        "/home/martin/OSM/vychod-with-mask.mbtiles",
     ];
 
     if req.method() != Method::GET {
@@ -73,39 +85,6 @@ pub async fn handle_request(
         .splitn(3, '/')
         .map(|a| a.parse::<u32>().ok())
         .collect();
-
-    fn get_blobs<'a, T: ToSql>(
-        source: &str,
-        data: &'a mut Vec<(Box<str>, Connection)>,
-        zoom: T,
-        x: T,
-        y: T,
-    ) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let conn = if let Some(index) = data.iter().position(|a| a.0.as_ref() == source) {
-            &data[index].1
-        } else {
-            data.push((source.into(), Connection::open(source)?));
-            &data.last().unwrap().1
-        };
-
-        let mut stmt = conn.prepare(concat!(
-            "SELECT tile_data, tile_alpha ",
-            "FROM tiles ",
-            "WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3"
-        ))?;
-
-        let mut rows = stmt.query([zoom, x, y])?;
-
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-
-        let tile_data = row.get::<_, Vec<u8>>(0)?;
-
-        let tile_alpha = row.get::<_, Vec<u8>>(1)?;
-
-        return Ok(Some((tile_data, tile_alpha)));
-    }
 
     match (
         parts.get(0).copied().flatten(),
@@ -134,12 +113,11 @@ pub async fn handle_request(
                         return Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None));
                     };
 
-                    if tile_alpha.is_empty() {
-                        return Ok(Bytes::from(tile_data));
-                    }
-
-                    let mut either: Either<Vec<u8>, ImageBuffer<Rgba<u8>, Vec<u8>>> =
-                        Either::Left(tile_data);
+                    let mut image = if tile_alpha.is_empty() {
+                        Image::Raw(tile_data)
+                    } else {
+                        Image::Raster(to_raster(&tile_data, &tile_alpha)?)
+                    };
 
                     while let Some(source) = iter.next() {
                         let Some((tile_data2, tile_alpha2)) = get_blobs(source, data, zoom, x, y)?
@@ -147,44 +125,41 @@ pub async fn handle_request(
                             continue;
                         };
 
-                        match &either {
-                            Either::Left(tile_data) => {
-                                let cursor = Cursor::new(tile_data);
-                                let decoder = JpegDecoder::new(cursor)?;
+                        if let Image::Raw(tile_data) = image {
+                            let raster = to_raster(&tile_data, &tile_alpha)?;
 
-                                let (w, h) = decoder.dimensions();
-
-                                let mut tile_data = vec![0; decoder.total_bytes() as usize];
-                                decoder.read_image(&mut tile_data)?;
-
-                                let mut rgba_img = RgbaImage::new(w, h);
-
-                                for (i, pixel) in rgba_img.pixels_mut().enumerate() {
-                                    let rgb_index = i * 3;
-
-                                    *pixel = Rgba([
-                                        tile_data[rgb_index],     // R
-                                        tile_data[rgb_index + 1], // G
-                                        tile_data[rgb_index + 2], // B
-                                        tile_alpha[i],            // A
-                                    ]);
-                                }
-
-                                either = Either::Right(rgba_img);
-                            }
-                            Either::Right(_) => todo!("compose"),
+                            image = Image::Raster(raster);
                         }
+
+                        let Image::Raster(ref mut dst) = image else {
+                            panic!("reached unreachable");
+                        };
+
+                        dst.composite_raster(
+                            (0, 0, 256, 256),
+                            &to_raster(&tile_data2, &tile_alpha2)?,
+                            (0, 0, 256, 256),
+                            SrcOver,
+                        );
                     }
 
-                    match either {
-                        Either::Left(tile_data) => Ok(Bytes::from(tile_data)),
-                        Either::Right(image_buffer) => {
+                    match image {
+                        Image::Raw(tile_data) => Ok(Bytes::from(tile_data)),
+                        Image::Raster(mut raster) => {
                             let mut out = vec![];
 
+                            raster.composite_color(
+                                (0, 0, 256, 256),
+                                Rgba8p::new(255, 255, 255, 255),
+                                DestOver,
+                            );
+
+                            let raster = Raster::<Rgba8>::with_raster(&raster);
+
                             jpeg_encoder::Encoder::new(&mut out, 90 /* TODO cfg */).encode(
-                                &image_buffer,
-                                image_buffer.width() as u16,
-                                image_buffer.height() as u16,
+                                raster.as_u8_slice(),
+                                raster.width() as u16,
+                                raster.height() as u16,
                                 jpeg_encoder::ColorType::Rgba, // ignores alpha
                             )?;
 
@@ -231,4 +206,74 @@ fn http_error_msg(
             .map_err(BodyError::Infillable)
             .boxed(),
     )
+}
+
+fn get_blobs<'a, T: ToSql>(
+    source: &str,
+    data: &'a mut Vec<(Box<str>, Connection)>,
+    zoom: T,
+    x: T,
+    y: T,
+) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let conn = if let Some(index) = data.iter().position(|a| a.0.as_ref() == source) {
+        &data[index].1
+    } else {
+        data.push((
+            source.into(),
+            Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+        ));
+        &data.last().unwrap().1
+    };
+
+    let mut stmt = conn.prepare(concat!(
+        "SELECT tile_data, tile_alpha ",
+        "FROM tiles ",
+        "WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3"
+    ))?;
+
+    let mut rows = stmt.query([zoom, x, y])?;
+
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+
+    let tile_data = row.get::<_, Vec<u8>>(0)?;
+
+    let tile_alpha = row.get::<_, Vec<u8>>(1)?;
+
+    return Ok(Some((tile_data, tile_alpha)));
+}
+
+fn to_raster(tile_data: &[u8], tile_alpha: &[u8]) -> Result<Raster<Rgba8p>, ProcessingError> {
+    let (w, h, tile_data) = decode_jpeg(tile_data)?;
+
+    let tile_alpha = if tile_alpha.is_empty() {
+        vec![255].repeat(tile_data.len() / 3)
+    } else {
+        zstd::stream::decode_all(tile_alpha)?
+    };
+
+    let tile: Vec<_> = tile_data
+        .chunks_exact(3)
+        .zip(tile_alpha)
+        .flat_map(|(chunk, v2_item)| chunk.iter().copied().chain(std::iter::once(v2_item)))
+        .collect();
+
+    Ok(Raster::<Rgba8p>::with_raster(
+        &Raster::<Rgba8>::with_u8_buffer(w, h, tile),
+    ))
+}
+
+fn decode_jpeg(tile_data: &[u8]) -> Result<(u32, u32, Vec<u8>), ProcessingError> {
+    let cursor = Cursor::new(tile_data);
+
+    let decoder = JpegDecoder::new(cursor)?;
+
+    let (w, h) = decoder.dimensions();
+
+    let mut tile_data = vec![0; decoder.total_bytes() as usize];
+
+    decoder.read_image(&mut tile_data)?;
+
+    Ok((w, h, tile_data))
 }
