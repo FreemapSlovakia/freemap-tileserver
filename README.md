@@ -26,7 +26,7 @@ Options:
 
 ## Sources
 
-Generate sources with `freemap-tiler`.
+Generate sources with [`freemap-tiler`](https://github.com/FreemapSlovakia/freemap-tiler).
 
 ## URL
 
