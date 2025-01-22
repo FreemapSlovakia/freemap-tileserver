@@ -1,4 +1,4 @@
-pub(crate) struct SourceWithLimits<T> {
+pub struct SourceWithLimits<T> {
     pub source: T,
     pub min_zoom: u32,
     pub max_zoom: u32,

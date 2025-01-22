@@ -30,7 +30,7 @@ enum ProcessingError {
     #[error("join error")]
     JoinError(#[from] JoinError),
 
-    #[error("not acceptable")]
+    #[error("HTTP error")]
     HttpError(StatusCode, Option<&'static str>),
 
     #[error("image encoding error: {0}")]
@@ -82,7 +82,7 @@ impl TryFrom<Cow<'_, str>> for Background {
             .chars()
             .chunks(2)
             .into_iter()
-            .map(|chunk| chunk.collect::<String>())
+            .map(Iterator::collect::<String>)
             .map(|c| u8::from_str_radix(&c, 16))
             .collect::<Result<Vec<u8>, _>>()
             .map_err(|_| BackgroundError())
@@ -99,7 +99,7 @@ pub async fn handle_request(
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    let url = Url::parse(&format!("http://localhost{}", req.uri().to_string())).unwrap();
+    let url = Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
 
     let parts: Vec<_> = url
         .path()
@@ -131,7 +131,7 @@ pub async fn handle_request(
         (Some(zoom), Some(x), Some(y)) if parts.len() == 3 => pool
             .spawn_blocking(move || {
                 THREAD_LOCAL_DATA.with_borrow_mut(|data| {
-                    let mut iter = sources.into_iter();
+                    let mut iter = sources.iter();
 
                     let tile = loop {
                         let Some(source) = iter.next() else {
@@ -180,7 +180,7 @@ pub async fn handle_request(
                         Image::Raster(to_raster(&tile_data, decompress_tile_alpha(&tile_alpha)?)?)
                     };
 
-                    while let Some(source) = iter.next() {
+                    for source in iter {
                         let Some((tile_data2, tile_alpha2)) = get_blobs(source, data, zoom, x, y)?
                         else {
                             continue;
@@ -203,8 +203,8 @@ pub async fn handle_request(
                         if zoom > 7 {
                             let mut to_change = vec![0u8; tile_alpha2.len()];
 
-                            for x in 0..(256 as usize) {
-                                for y in 0..(256 as usize) {
+                            for x in 0..256_usize {
+                                for y in 0..256_usize {
                                     let alpha: u8 = dst.pixel(x as i32, y as i32).alpha().into();
 
                                     if alpha > 128 && tile_alpha2[x + y * 256] < 128 {
@@ -229,7 +229,7 @@ pub async fn handle_request(
                             }
 
                             for i in 0..tile_alpha2.len() {
-                                tile_alpha2[i] = tile_alpha2[i] >> to_change[i];
+                                tile_alpha2[i] >>= to_change[i];
                             }
                         }
 
@@ -299,9 +299,9 @@ fn http_error_msg(
     )
 }
 
-fn get_blobs<'a>(
+fn get_blobs(
     source: &'static SourceWithLimits<&Path>,
-    data: &'a mut Vec<(&Path, Connection)>,
+    data: &mut Vec<(&Path, Connection)>,
     zoom: u32,
     x: u32,
     y: u32,
@@ -336,23 +336,19 @@ fn get_blobs<'a>(
 
     let mut rows = stmt.query((zoom, x, y))?;
 
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-
-    let tile_data = row.get::<_, Vec<u8>>(0)?;
-
-    let tile_alpha = row.get::<_, Vec<u8>>(1)?;
-
-    return Ok(Some((tile_data, tile_alpha)));
+    Ok(if let Some(row) = rows.next()? {
+        Some((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    } else {
+        None
+    })
 }
 
 fn decompress_tile_alpha(tile_alpha: &[u8]) -> Result<Vec<u8>, ProcessingError> {
-    if tile_alpha.is_empty() {
-        Ok(vec![255; 256 * 256])
+    Ok(if tile_alpha.is_empty() {
+        vec![255; 256 * 256]
     } else {
-        Ok(zstd::stream::decode_all(tile_alpha)?)
-    }
+        zstd::stream::decode_all(tile_alpha)?
+    })
 }
 
 fn to_raster(tile_data: &[u8], tile_alpha: Vec<u8>) -> Result<Raster<Rgba8p>, ProcessingError> {
