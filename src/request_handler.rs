@@ -12,11 +12,16 @@ use pix::{
     Raster,
 };
 use rusqlite::{Connection, OpenFlags};
-use std::{borrow::Cow, collections::HashMap, convert::Infallible, path::PathBuf};
-use std::{cell::RefCell, sync::Arc};
-use std::{io::Cursor, path::Path};
-use tokio::runtime::Runtime;
-use tokio::task::JoinError;
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::HashMap,
+    convert::Infallible,
+    io::Cursor,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{runtime::Runtime, task::JoinError};
 use url::Url;
 
 use crate::structs::SourceLimits;

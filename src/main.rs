@@ -22,11 +22,11 @@ use tokio::net::TcpListener;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Address to listen on. Default 127.0.0.1:3003
+    /// Address to listen on
     #[arg(short, long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 3003)))]
     listen_address: SocketAddr,
 
-    /// Raster file
+    /// Source file, can be specified multiple times (order matters)
     #[arg(short, long, required = true)]
     source: Vec<PathBuf>,
 }
