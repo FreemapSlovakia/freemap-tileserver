@@ -109,7 +109,7 @@ pub async fn handle_request(
         .map(|a| a.parse::<u32>().ok())
         .collect();
 
-    let mut background = Background(Rgba8p::new(0, 0, 0, 255));
+    let mut background = Background(Rgba8p::new(255, 255, 255, 255));
 
     for pair in url.query_pairs() {
         match pair.0.as_ref() {
