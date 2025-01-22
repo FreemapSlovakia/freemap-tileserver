@@ -12,14 +12,14 @@ use pix::{
     Raster,
 };
 use rusqlite::{Connection, OpenFlags};
-use std::{borrow::Cow, convert::Infallible};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, path::PathBuf};
 use std::{cell::RefCell, sync::Arc};
 use std::{io::Cursor, path::Path};
 use tokio::runtime::Runtime;
 use tokio::task::JoinError;
 use url::Url;
 
-use crate::structs::SourceWithLimits;
+use crate::structs::SourceLimits;
 
 thread_local! {
     static THREAD_LOCAL_DATA: RefCell<Vec<(&Path, Connection)>> = const {RefCell::new(Vec::new())};
@@ -30,9 +30,8 @@ enum ProcessingError {
     #[error("join error")]
     JoinError(#[from] JoinError),
 
-    #[error("HTTP error")]
-    HttpError(StatusCode, Option<&'static str>),
-
+    // #[error("HTTP error")]
+    // HttpError(StatusCode, Option<&'static str>),
     #[error("image encoding error: {0}")]
     ImageEncodingError(#[from] ImageError),
 
@@ -93,7 +92,7 @@ impl TryFrom<Cow<'_, str>> for Background {
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
-    sources: &'static [SourceWithLimits<&Path>],
+    sources: &'static Vec<(PathBuf, HashMap<u8, SourceLimits>)>,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
     if req.method() != Method::GET {
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
@@ -101,13 +100,13 @@ pub async fn handle_request(
 
     let url = Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
 
-    let parts: Vec<_> = url
-        .path()
-        .get(1..)
-        .unwrap_or_default()
-        .splitn(3, '/')
-        .map(|a| a.parse::<u32>().ok())
-        .collect();
+    let parts: Vec<_> = url.path().get(1..).unwrap_or_default().split('/').collect();
+
+    let tile = (
+        parts.get(0).map(|v| v.parse::<u8>().ok()).flatten(),
+        parts.get(1).map(|v| v.parse::<u32>().ok()).flatten(),
+        parts.get(2).map(|v| v.parse::<u32>().ok()).flatten(),
+    );
 
     let mut background = Background(Rgba8p::new(255, 255, 255, 255));
 
@@ -123,11 +122,7 @@ pub async fn handle_request(
         }
     }
 
-    match (
-        parts.get(0).copied().flatten(),
-        parts.get(1).copied().flatten(),
-        parts.get(2).copied().flatten(),
-    ) {
+    match tile {
         (Some(zoom), Some(x), Some(y)) if parts.len() == 3 => pool
             .spawn_blocking(move || {
                 THREAD_LOCAL_DATA.with_borrow_mut(|data| {
@@ -264,13 +259,13 @@ pub async fn handle_request(
             .and_then(|inner_result| inner_result)
             .map_or_else(
                 |e| {
-                    if let ProcessingError::HttpError(sc, message) = e {
-                        http_error_msg(sc, message.unwrap_or_else(|| sc.as_str()))
-                    } else {
-                        eprintln!("Error: {e}");
+                    // if let ProcessingError::HttpError(sc, message) = e {
+                    //     http_error_msg(sc, message.unwrap_or_else(|| sc.as_str()))
+                    // } else {
+                    eprintln!("Error: {e}");
 
-                        http_error(StatusCode::INTERNAL_SERVER_ERROR)
-                    }
+                    http_error(StatusCode::INTERNAL_SERVER_ERROR)
+                    // }
                 },
                 |data| {
                     Response::builder()
@@ -300,23 +295,21 @@ fn http_error_msg(
 }
 
 fn get_blobs(
-    source: &'static SourceWithLimits<&Path>,
+    source: &'static (PathBuf, HashMap<u8, SourceLimits>),
     data: &mut Vec<(&Path, Connection)>,
-    zoom: u32,
+    zoom: u8,
     x: u32,
     y: u32,
 ) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    if zoom < source.min_zoom
-        || zoom > source.max_zoom
-        || x < source.min_x
-        || x > source.max_x
-        || y < source.min_y
-        || y > source.max_y
-    {
+    let Some(limits) = source.1.get(&zoom) else {
+        return Ok(None);
+    };
+
+    if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
         return Ok(None);
     }
 
-    let source = source.source;
+    let source = source.0.as_path();
 
     let conn = if let Some(index) = data.iter().position(|a| a.0 == source) {
         &data[index].1
