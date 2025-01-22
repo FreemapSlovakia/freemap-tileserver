@@ -4,6 +4,7 @@ use hyper::{
     Method, Request, Response, StatusCode,
 };
 use image::{codecs::jpeg::JpegDecoder, ImageDecoder, ImageError};
+use itertools::Itertools;
 use pix::{
     el::Pixel,
     ops::{DestOver, SrcOver},
@@ -11,7 +12,7 @@ use pix::{
     Raster,
 };
 use rusqlite::{Connection, OpenFlags};
-use std::convert::Infallible;
+use std::{borrow::Cow, convert::Infallible};
 use std::{cell::RefCell, sync::Arc};
 use std::{io::Cursor, path::Path};
 use tokio::runtime::Runtime;
@@ -65,6 +66,30 @@ enum Image {
     Raster(Raster<Rgba8p>),
 }
 
+struct Background(Rgba8p);
+
+struct BackgroundError();
+
+impl TryFrom<Cow<'_, str>> for Background {
+    type Error = BackgroundError;
+
+    fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> {
+        if value.len() != 6 {
+            return Err(BackgroundError());
+        }
+
+        value
+            .chars()
+            .chunks(2)
+            .into_iter()
+            .map(|chunk| chunk.collect::<String>())
+            .map(|c| u8::from_str_radix(&c, 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| BackgroundError())
+            .map(|rgb| Self(Rgba8p::new(rgb[0], rgb[1], rgb[2], 255)))
+    }
+}
+
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
@@ -83,6 +108,20 @@ pub async fn handle_request(
         .splitn(3, '/')
         .map(|a| a.parse::<u32>().ok())
         .collect();
+
+    let mut background = Background(Rgba8p::new(0, 0, 0, 255));
+
+    for pair in url.query_pairs() {
+        match pair.0.as_ref() {
+            "background" | "bg" => {
+                background = match pair.1.try_into() {
+                    Ok(bg) => bg,
+                    Err(_) => return http_error(StatusCode::BAD_REQUEST),
+                }
+            }
+            _ => {}
+        }
+    }
 
     match (
         parts.get(0).copied().flatten(),
@@ -180,11 +219,7 @@ pub async fn handle_request(
                         Image::Raster(mut raster) => {
                             let mut out = vec![];
 
-                            raster.composite_color(
-                                (0, 0, 256, 256),
-                                Rgba8p::new(255, 255, 192, 255),
-                                DestOver,
-                            );
+                            raster.composite_color((0, 0, 256, 256), background.0, DestOver);
 
                             let raster = Raster::<Rgba8>::with_raster(&raster);
 
