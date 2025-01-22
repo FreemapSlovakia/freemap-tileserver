@@ -100,7 +100,9 @@ pub async fn handle_request(
 
     let url = Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
 
-    let parts: Vec<_> = url.path().get(1..).unwrap_or_default().split('/').collect();
+    let tile = url.path().get(1..).unwrap_or_default().replace(".jpg", "");
+
+    let parts: Vec<_> = tile.split('/').collect();
 
     let tile = (
         parts.get(0).map(|v| v.parse::<u8>().ok()).flatten(),
