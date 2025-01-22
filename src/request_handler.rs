@@ -147,7 +147,31 @@ pub async fn handle_request(
                     };
 
                     let Some((tile_data, tile_alpha)) = tile else {
-                        return Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None));
+                        // if let Some((tile_data, tile_alpha)) =
+                        //     get_blobs(source, data, zoom - 1, x / 2, y / 2)?
+                        // {
+                        // }
+
+                        let mut out = vec![];
+
+                        let empty: Vec<u8> = background
+                            .0
+                            .channels()
+                            .iter()
+                            .take(3)
+                            .map(|ch| -> u8 { (*ch).into() })
+                            .collect();
+
+                        jpeg_encoder::Encoder::new(&mut out, 90 /* TODO cfg */).encode(
+                            &empty.repeat(256 * 256),
+                            256,
+                            256,
+                            jpeg_encoder::ColorType::Rgb,
+                        )?;
+
+                        return Ok(Bytes::from(out));
+
+                        // return Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None));
                     };
 
                     let mut image = if tile_alpha.is_empty() {
