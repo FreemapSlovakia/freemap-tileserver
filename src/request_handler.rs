@@ -5,6 +5,7 @@ use hyper::{
 };
 use image::{codecs::jpeg::JpegDecoder, ImageDecoder, ImageError};
 use pix::{
+    el::Pixel,
     ops::{DestOver, SrcOver},
     rgb::{Rgba8, Rgba8p},
     Raster,
@@ -18,7 +19,7 @@ use tokio::task::JoinError;
 use url::Url;
 
 thread_local! {
-    static THREAD_LOCAL_DATA: RefCell<Vec<(Box<str>, Connection)>> = const {RefCell::new(Vec::new())};
+    static THREAD_LOCAL_DATA: RefCell<Vec<(&Path, Connection)>> = const {RefCell::new(Vec::new())};
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -65,12 +66,17 @@ enum Image {
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
-    raster_path: &'static Path,
+    sources: &'static [&Path],
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
-    let sources = vec![
-        "/home/martin/OSM/stred-with-mask.mbtiles",
-        "/home/martin/OSM/vychod-with-mask.mbtiles",
-    ];
+    // let sources = vec![
+    //     "/home/martin/OSM/stred-with-mask.mbtiles",
+    //     "/home/martin/OSM/vychod-with-mask.mbtiles",
+    //     "/home/martin/OSM/zapad-w-a.mbtiles",
+    //     // "/home/martin/OSM/left.mbtiles",
+    //     // "/home/martin/OSM/right.mbtiles",
+    //     // "/home/martin/OSM/s.mbtiles",
+    //     // "/home/martin/OSM/v.mbtiles",
+    // ];
 
     if req.method() != Method::GET {
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
@@ -101,7 +107,7 @@ pub async fn handle_request(
                             break None;
                         };
 
-                        let Some((tile_data, tile_alpha)) = get_blobs(source, data, zoom, x, y)?
+                        let Some((tile_data, tile_alpha)) = get_blobs(*source, data, zoom, x, y)?
                         else {
                             continue;
                         };
@@ -116,7 +122,7 @@ pub async fn handle_request(
                     let mut image = if tile_alpha.is_empty() {
                         Image::Raw(tile_data)
                     } else {
-                        Image::Raster(to_raster(&tile_data, &tile_alpha)?)
+                        Image::Raster(to_raster(&tile_data, decompress_tile_alpha(&tile_alpha)?)?)
                     };
 
                     while let Some(source) = iter.next() {
@@ -126,7 +132,8 @@ pub async fn handle_request(
                         };
 
                         if let Image::Raw(tile_data) = image {
-                            let raster = to_raster(&tile_data, &tile_alpha)?;
+                            let raster =
+                                to_raster(&tile_data, decompress_tile_alpha(&tile_alpha)?)?;
 
                             image = Image::Raster(raster);
                         }
@@ -135,12 +142,45 @@ pub async fn handle_request(
                             panic!("reached unreachable");
                         };
 
-                        dst.composite_raster(
-                            (0, 0, 256, 256),
-                            &to_raster(&tile_data2, &tile_alpha2)?,
-                            (0, 0, 256, 256),
-                            SrcOver,
-                        );
+                        let mut tile_alpha2 = decompress_tile_alpha(&tile_alpha2)?;
+
+                        // this is to remove darkened borders caused by lanczos data+mask resizing
+                        if zoom > 7 {
+                            let mut to_change = vec![0u8; tile_alpha2.len()];
+
+                            for x in 0..(256 as usize) {
+                                for y in 0..(256 as usize) {
+                                    let alpha: u8 = dst.pixel(x as i32, y as i32).alpha().into();
+
+                                    if alpha > 128 && tile_alpha2[x + y * 256] < 128 {
+                                        for ny in -2..=2_i32 {
+                                            for nx in -2..=2_i32 {
+                                                let val = (nx.abs() + ny.abs()) as u8;
+
+                                                let index = ((y as i32 + ny).clamp(0, 255) * 256
+                                                    + (x as i32 + nx).clamp(0, 255))
+                                                    as usize;
+
+                                                to_change[index] =
+                                                    to_change[index].max(match val {
+                                                        0..=1 => 7,
+                                                        2 => 1,
+                                                        3.. => 0,
+                                                    });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            for i in 0..tile_alpha2.len() {
+                                tile_alpha2[i] = tile_alpha2[i] >> to_change[i];
+                            }
+                        }
+
+                        let src = to_raster(&tile_data2, tile_alpha2)?;
+
+                        dst.composite_raster((0, 0, 256, 256), &src, (0, 0, 256, 256), SrcOver);
                     }
 
                     match image {
@@ -150,7 +190,7 @@ pub async fn handle_request(
 
                             raster.composite_color(
                                 (0, 0, 256, 256),
-                                Rgba8p::new(255, 255, 255, 255),
+                                Rgba8p::new(255, 255, 192, 255),
                                 DestOver,
                             );
 
@@ -209,17 +249,17 @@ fn http_error_msg(
 }
 
 fn get_blobs<'a, T: ToSql>(
-    source: &str,
-    data: &'a mut Vec<(Box<str>, Connection)>,
+    source: &'static Path,
+    data: &'a mut Vec<(&Path, Connection)>,
     zoom: T,
     x: T,
     y: T,
 ) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let conn = if let Some(index) = data.iter().position(|a| a.0.as_ref() == source) {
+    let conn = if let Some(index) = data.iter().position(|a| a.0 == source) {
         &data[index].1
     } else {
         data.push((
-            source.into(),
+            source,
             Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
         ));
         &data.last().unwrap().1
@@ -244,14 +284,16 @@ fn get_blobs<'a, T: ToSql>(
     return Ok(Some((tile_data, tile_alpha)));
 }
 
-fn to_raster(tile_data: &[u8], tile_alpha: &[u8]) -> Result<Raster<Rgba8p>, ProcessingError> {
-    let (w, h, tile_data) = decode_jpeg(tile_data)?;
-
-    let tile_alpha = if tile_alpha.is_empty() {
-        vec![255].repeat(tile_data.len() / 3)
+fn decompress_tile_alpha(tile_alpha: &[u8]) -> Result<Vec<u8>, ProcessingError> {
+    if tile_alpha.is_empty() {
+        Ok(vec![255; 256 * 256])
     } else {
-        zstd::stream::decode_all(tile_alpha)?
-    };
+        Ok(zstd::stream::decode_all(tile_alpha)?)
+    }
+}
+
+fn to_raster(tile_data: &[u8], tile_alpha: Vec<u8>) -> Result<Raster<Rgba8p>, ProcessingError> {
+    let (w, h, tile_data) = decode_jpeg(tile_data)?;
 
     let tile: Vec<_> = tile_data
         .chunks_exact(3)

@@ -18,12 +18,12 @@ use tokio::net::TcpListener;
 #[command(version, about, long_about = None)]
 struct Args {
     /// Address to listen on. Default 127.0.0.1:3003
-    #[arg(short, long)]
-    socket_addr: Option<String>,
+    #[arg(short, long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 3003)))]
+    listen_address: SocketAddr,
 
     /// Raster file
-    #[arg(short, long)]
-    raster_file: PathBuf,
+    #[arg(short, long, required = true)]
+    source: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -45,16 +45,15 @@ async fn main() -> Result<()> {
             .build()?,
     );
 
-    let addr: SocketAddr = args.socket_addr.map_or_else(
-        || Ok(SocketAddr::from(([127, 0, 0, 1], 3003))),
-        |s| s.parse(),
-    )?;
+    let sources: &'static [&Path] = Box::leak(
+        Box::leak(args.source.into_boxed_slice())
+            .iter()
+            .map(|pb| pb.as_path())
+            .collect::<Vec<&Path>>()
+            .into_boxed_slice(),
+    );
 
-    let raster_file: &Path = Box::leak(args.raster_file.into_boxed_path());
-
-    // let raster_file = Arc::new(&args.raster_file);
-
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(args.listen_address).await?;
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -66,7 +65,7 @@ async fn main() -> Result<()> {
         let sfn = service_fn(move |req| {
             let pool = pool.clone();
 
-            async move { handle_request(pool, req, raster_file).await }
+            async move { handle_request(pool, req, sources).await }
         });
 
         tokio::spawn(async move {
