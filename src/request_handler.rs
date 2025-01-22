@@ -10,13 +10,15 @@ use pix::{
     rgb::{Rgba8, Rgba8p},
     Raster,
 };
-use rusqlite::{Connection, OpenFlags, ToSql};
+use rusqlite::{Connection, OpenFlags};
 use std::convert::Infallible;
 use std::{cell::RefCell, sync::Arc};
 use std::{io::Cursor, path::Path};
 use tokio::runtime::Runtime;
 use tokio::task::JoinError;
 use url::Url;
+
+use crate::structs::SourceWithLimits;
 
 thread_local! {
     static THREAD_LOCAL_DATA: RefCell<Vec<(&Path, Connection)>> = const {RefCell::new(Vec::new())};
@@ -66,18 +68,8 @@ enum Image {
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
-    sources: &'static [&Path],
+    sources: &'static [SourceWithLimits<&Path>],
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
-    // let sources = vec![
-    //     "/home/martin/OSM/stred-with-mask.mbtiles",
-    //     "/home/martin/OSM/vychod-with-mask.mbtiles",
-    //     "/home/martin/OSM/zapad-w-a.mbtiles",
-    //     // "/home/martin/OSM/left.mbtiles",
-    //     // "/home/martin/OSM/right.mbtiles",
-    //     // "/home/martin/OSM/s.mbtiles",
-    //     // "/home/martin/OSM/v.mbtiles",
-    // ];
-
     if req.method() != Method::GET {
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
     }
@@ -102,12 +94,12 @@ pub async fn handle_request(
                 THREAD_LOCAL_DATA.with_borrow_mut(|data| {
                     let mut iter = sources.into_iter();
 
-                    let r1 = loop {
+                    let tile = loop {
                         let Some(source) = iter.next() else {
                             break None;
                         };
 
-                        let Some((tile_data, tile_alpha)) = get_blobs(*source, data, zoom, x, y)?
+                        let Some((tile_data, tile_alpha)) = get_blobs(source, data, zoom, x, y)?
                         else {
                             continue;
                         };
@@ -115,7 +107,7 @@ pub async fn handle_request(
                         break Some((tile_data, tile_alpha));
                     };
 
-                    let Some((tile_data, tile_alpha)) = r1 else {
+                    let Some((tile_data, tile_alpha)) = tile else {
                         return Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None));
                     };
 
@@ -248,13 +240,25 @@ fn http_error_msg(
     )
 }
 
-fn get_blobs<'a, T: ToSql>(
-    source: &'static Path,
+fn get_blobs<'a>(
+    source: &'static SourceWithLimits<&Path>,
     data: &'a mut Vec<(&Path, Connection)>,
-    zoom: T,
-    x: T,
-    y: T,
+    zoom: u32,
+    x: u32,
+    y: u32,
 ) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    if zoom < source.min_zoom
+        || zoom > source.max_zoom
+        || x < source.min_x
+        || x > source.max_x
+        || y < source.min_y
+        || y > source.max_y
+    {
+        return Ok(None);
+    }
+
+    let source = source.source;
+
     let conn = if let Some(index) = data.iter().position(|a| a.0 == source) {
         &data[index].1
     } else {
@@ -271,7 +275,7 @@ fn get_blobs<'a, T: ToSql>(
         "WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3"
     ))?;
 
-    let mut rows = stmt.query([zoom, x, y])?;
+    let mut rows = stmt.query((zoom, x, y))?;
 
     let Some(row) = rows.next()? else {
         return Ok(None);
