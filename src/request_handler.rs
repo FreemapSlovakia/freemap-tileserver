@@ -125,6 +125,8 @@ pub async fn handle_request(
     match tile {
         (Some(zoom), Some(x), Some(y)) if parts.len() == 3 => pool
             .spawn_blocking(move || {
+                let y = (1 << zoom) - 1 - y;
+
                 THREAD_LOCAL_DATA.with_borrow_mut(|data| {
                     let mut iter = sources.iter();
 
