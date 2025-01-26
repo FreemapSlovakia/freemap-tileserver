@@ -16,6 +16,9 @@ pub struct SourceWithLimits {
 }
 
 pub struct TileData {
+    /// 1 2<br>
+    /// 3 4
+    pub quad: u8,
     pub rgb: Vec<u8>,
     pub alpha: Vec<u8>,
 }

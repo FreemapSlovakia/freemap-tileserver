@@ -3,7 +3,7 @@ use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response, StatusCode,
 };
-use image::{codecs::jpeg::JpegDecoder, ImageDecoder, ImageError};
+use image::{codecs::jpeg::JpegDecoder, DynamicImage, ImageBuffer, ImageDecoder, ImageError, Rgba};
 use itertools::Itertools;
 use pix::{
     el::Pixel,
@@ -98,7 +98,7 @@ impl TryFrom<Cow<'_, str>> for Background {
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
-    sources: &'static Vec<SourceWithLimits>,
+    sources_with_limits: &'static Vec<SourceWithLimits>,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
     if req.method() != Method::GET {
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
@@ -141,28 +141,35 @@ pub async fn handle_request(
                 let y = (1 << zoom) - 1 - y;
 
                 SOURCE_CONNECTIONS.with_borrow_mut(|source_connections| {
-                    let mut iter = sources.iter();
+                    let mut iter = sources_with_limits.iter();
 
                     let tile_data = loop {
-                        let Some(source) = iter.next() else {
+                        let Some(source_with_limits) = iter.next() else {
                             break None; // no source at all
                         };
 
                         if let Some(tile_data) =
-                            get_tile_data(source, source_connections, zoom, x, y)?
+                            get_tile_data(source_with_limits, source_connections, zoom, x, y)?
                         {
                             break Some(tile_data);
                         };
 
-                        get_tile_data(source, source_connections, zoom - 1, x / 2, y / 2)?;
+                        if zoom == 20 && !source_with_limits.limits.contains_key(&20) {
+                            if let Some(tile_data) = get_tile_data(
+                                source_with_limits,
+                                source_connections,
+                                zoom - 1,
+                                x / 2,
+                                y / 2,
+                            )? {
+                                let quad = (1 + (x % 2) + 2 * (y % 2)) as u8;
+
+                                break Some(TileData { quad, ..tile_data });
+                            }
+                        }
                     };
 
                     let Some(tile_data) = tile_data else {
-                        // if let Some((tile_data, tile_alpha)) =
-                        //     get_blobs(source, data, zoom - 1, x / 2, y / 2)?
-                        // {
-                        // }
-
                         return if fallback_missing {
                             let mut out = vec![];
 
@@ -187,12 +194,13 @@ pub async fn handle_request(
                         };
                     };
 
-                    let mut image = if tile_data.alpha.is_empty() {
-                        Image::Raw(tile_data.rgb)
+                    let mut image = if tile_data.alpha.is_empty() && tile_data.quad == 0 {
+                        Image::Raw(tile_data.rgb) // no recompression
                     } else {
                         Image::Raster(to_raster(
                             &tile_data.rgb,
                             decompress_tile_alpha(&tile_data.alpha)?,
+                            tile_data.quad,
                         )?)
                     };
 
@@ -203,9 +211,12 @@ pub async fn handle_request(
                             continue;
                         };
 
-                        if let Image::Raw(tile_data) = image {
-                            let raster =
-                                to_raster(&tile_data, decompress_tile_alpha(&tile_data2.alpha)?)?;
+                        if let Image::Raw(rgb) = image {
+                            let raster = to_raster(
+                                &rgb,
+                                decompress_tile_alpha(&tile_data.alpha)?,
+                                tile_data.quad,
+                            )?;
 
                             image = Image::Raster(raster);
                         }
@@ -250,7 +261,7 @@ pub async fn handle_request(
                             }
                         }
 
-                        let src = to_raster(&tile_data2.rgb, tile_alpha2)?;
+                        let src = to_raster(&tile_data2.rgb, tile_alpha2, tile_data2.quad)?;
 
                         dst.composite_raster((0, 0, 256, 256), &src, (0, 0, 256, 256), SrcOver);
                     }
@@ -327,9 +338,7 @@ fn get_tile_data(
         return Ok(None);
     };
 
-    let ry = (1 << zoom) - 1 - y;
-
-    if x < limits.min_x || x > limits.max_x || ry < limits.min_y || ry > limits.max_y {
+    if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
         return Ok(None);
     }
 
@@ -355,6 +364,7 @@ fn get_tile_data(
 
     let tile_data = if let Some(row) = rows.next()? {
         Some(TileData {
+            quad: 0,
             rgb: row.get::<_, Vec<u8>>(0)?,
             alpha: row.get::<_, Vec<u8>>(1)?,
         })
@@ -373,7 +383,11 @@ fn decompress_tile_alpha(tile_alpha: &[u8]) -> Result<Vec<u8>, ProcessingError> 
     })
 }
 
-fn to_raster(tile_data: &[u8], tile_alpha: Vec<u8>) -> Result<Raster<Rgba8p>, ProcessingError> {
+fn to_raster(
+    tile_data: &[u8],
+    tile_alpha: Vec<u8>,
+    quad: u8,
+) -> Result<Raster<Rgba8p>, ProcessingError> {
     let (w, h, tile_data) = decode_jpeg(tile_data)?;
 
     let tile: Vec<_> = tile_data
@@ -382,9 +396,62 @@ fn to_raster(tile_data: &[u8], tile_alpha: Vec<u8>) -> Result<Raster<Rgba8p>, Pr
         .flat_map(|(chunk, v2_item)| chunk.iter().copied().chain(std::iter::once(v2_item)))
         .collect();
 
-    Ok(Raster::<Rgba8p>::with_raster(
-        &Raster::<Rgba8>::with_u8_buffer(w, h, tile),
-    ))
+    let raster = Raster::<Rgba8p>::with_raster(&Raster::<Rgba8>::with_u8_buffer(w, h, tile));
+
+    let raster = if quad == 0 {
+        raster
+    } else {
+        scale_and_crop(
+            raster,
+            ((quad as u32 - 1) & 1) * 256,
+            256 - ((quad as u32 - 1) / 2 & 1) * 256,
+        )
+    };
+
+    Ok(raster)
+}
+
+fn scale_and_crop(raster: Raster<Rgba8p>, ox: u32, oy: u32) -> Raster<Rgba8p> {
+    // Step 1: Convert `pix` raster to `image` buffer
+    let width = raster.width() as u32;
+    let height = raster.height() as u32;
+
+    let image_buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(width, height, |x, y| {
+            let pixel = raster.pixel(x as i32, y as i32);
+
+            let rgba = pixel.channels();
+
+            Rgba([
+                rgba[0].into(),
+                rgba[1].into(),
+                rgba[2].into(),
+                rgba[3].into(),
+            ])
+        });
+
+    // Step 2: Resize using `image` crate
+    let resized_image = DynamicImage::ImageRgba8(image_buffer).resize_exact(
+        512,
+        512,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    // Step 3: Crop the top-left 256x256 corner
+    let cropped_image = resized_image.crop_imm(ox, oy, 256, 256);
+
+    // Step 4: Convert back to `pix` raster
+    let cropped_raster = Raster::<Rgba8p>::with_pixels(
+        256,
+        256,
+        cropped_image
+            .to_rgba8()
+            .pixels()
+            .map(|p| Rgba8p::new(p[0], p[1], p[2], p[3]))
+            .collect::<Vec<_>>(),
+    );
+
+    cropped_raster
 }
 
 fn decode_jpeg(tile_data: &[u8]) -> Result<(u32, u32, Vec<u8>), ProcessingError> {
