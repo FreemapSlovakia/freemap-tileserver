@@ -118,44 +118,60 @@ pub async fn handle_request(
                 let y = (1 << zoom) - 1 - y;
 
                 SOURCE_CONNECTIONS.with_borrow_mut(|source_connections| {
+                    let get_upscaled_tile_data =
+                        |source_connections: &mut Vec<SourceConnection>,
+                         source_with_limits: &'static SourceWithLimits|
+                         -> Result<Option<TileData>, rusqlite::Error> {
+                            if let Some(tile_data) =
+                                get_tile_data(source_with_limits, source_connections, zoom, x, y)?
+                            {
+                                return Ok(Some(tile_data));
+                            };
+
+                            let mut zoom = zoom;
+                            let mut n = 0;
+
+                            while zoom > 0
+                                && n < 8
+                                && !source_with_limits.limits.contains_key(&zoom)
+                            {
+                                zoom -= 1;
+                                n += 1;
+
+                                let tile_data = get_tile_data(
+                                    source_with_limits,
+                                    source_connections,
+                                    zoom,
+                                    x >> n,
+                                    y >> n,
+                                )?;
+
+                                if let Some(tile_data) = tile_data {
+                                    return Ok(Some(TileData {
+                                        shift: Some(TileShift {
+                                            x: (x & ((1 << n) - 1)) as u8,
+                                            y: (y & ((1 << n) - 1)) as u8,
+                                            level: n,
+                                        }),
+                                        ..tile_data
+                                    }));
+                                }
+                            }
+
+                            return Ok(None);
+                        };
+
                     let mut iter = context.sources.iter();
 
-                    let tile_data = 'out: loop {
+                    let tile_data = loop {
                         let Some(source_with_limits) = iter.next() else {
                             break None; // no source at all
                         };
 
                         if let Some(tile_data) =
-                            get_tile_data(source_with_limits, source_connections, zoom, x, y)?
+                            get_upscaled_tile_data(source_connections, source_with_limits)?
                         {
                             break Some(tile_data);
-                        };
-
-                        let mut zoom = zoom;
-                        let mut n = 0;
-
-                        while zoom > 0 && n < 8 && !source_with_limits.limits.contains_key(&zoom) {
-                            zoom -= 1;
-                            n += 1;
-
-                            let tile_data = get_tile_data(
-                                source_with_limits,
-                                source_connections,
-                                zoom,
-                                x >> n,
-                                y >> n,
-                            )?;
-
-                            if let Some(tile_data) = tile_data {
-                                break 'out Some(TileData {
-                                    shift: Some(TileShift {
-                                        x: (x & ((1 << n) - 1)) as u8,
-                                        y: (y & ((1 << n) - 1)) as u8,
-                                        level: n,
-                                    }),
-                                    ..tile_data
-                                });
-                            }
                         }
                     };
 
@@ -195,8 +211,7 @@ pub async fn handle_request(
                     };
 
                     for source in iter {
-                        let Some(tile_data2) =
-                            get_tile_data(source, source_connections, zoom, x, y)?
+                        let Some(tile_data2) = get_upscaled_tile_data(source_connections, source)?
                         else {
                             continue;
                         };
@@ -218,7 +233,7 @@ pub async fn handle_request(
                         let mut tile_alpha2 = decompress_tile_alpha(&tile_data2.alpha)?;
 
                         // this is to remove darkened borders caused by lanczos data+mask resizing
-                        if zoom > 7 {
+                        if zoom > 6 {
                             let mut to_change = vec![0u8; tile_alpha2.len()];
 
                             for x in 0..256_usize {
