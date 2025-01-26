@@ -1,11 +1,14 @@
+mod background;
 mod bbox;
 mod request_handler;
 mod structs;
 
 use anyhow::Result;
+use background::Background;
 use clap::Parser;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use pix::rgb::Rgba8p;
 use request_handler::handle_request;
 use rusqlite::{Connection, OpenFlags};
 use std::{
@@ -16,7 +19,7 @@ use std::{
     sync::Arc,
     thread,
 };
-use structs::{SourceLimits, SourceWithLimits};
+use structs::{Context, SourceLimits, SourceWithLimits};
 use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
@@ -29,6 +32,10 @@ struct Args {
     /// Source file, can be specified multiple times (order matters)
     #[arg(short, long, required = true)]
     source: Vec<PathBuf>,
+
+    /// Default background color
+    #[arg(short, long, default_value_t = Background(Rgba8p::new(255, 255, 255, 255)))]
+    default_background: Background,
 }
 
 #[tokio::main]
@@ -94,8 +101,6 @@ async fn main() -> Result<()> {
 
     println!(" done.");
 
-    // println!("{}", serde_json::to_string(&sources)?);
-
     // Create a dedicated Tokio runtime for Dataset tasks.
     let dataset_runtime = Arc::new(
         tokio::runtime::Builder::new_current_thread()
@@ -111,7 +116,10 @@ async fn main() -> Result<()> {
             .build()?,
     );
 
-    let sources: &'static Vec<_> = Box::leak(Box::new(sources));
+    let context: &'static Context = Box::leak(Box::new(Context {
+        sources,
+        default_background: Background::try_from(args.default_background)?,
+    }));
 
     let listener = TcpListener::bind(args.listen_address).await?;
 
@@ -127,7 +135,7 @@ async fn main() -> Result<()> {
         let sfn = service_fn(move |req| {
             let pool = pool.clone();
 
-            async move { handle_request(pool, req, sources).await }
+            async move { handle_request(pool, req, context).await }
         });
 
         tokio::spawn(async move {

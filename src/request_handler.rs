@@ -1,10 +1,13 @@
+use crate::{
+    background::Background,
+    structs::{Context, SourceWithLimits, TileData, TileShift},
+};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response, StatusCode,
 };
 use image::{codecs::jpeg::JpegDecoder, DynamicImage, ImageBuffer, ImageDecoder, ImageError, Rgba};
-use itertools::Itertools;
 use pix::{
     el::Pixel,
     ops::{DestOver, SrcOver},
@@ -15,8 +18,6 @@ use rusqlite::{Connection, OpenFlags};
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, io::Cursor, path::Path, sync::Arc};
 use tokio::{runtime::Runtime, task::JoinError};
 use url::Url;
-
-use crate::structs::{SourceWithLimits, TileData};
 
 struct SourceConnection<'a> {
     source: &'a Path,
@@ -71,34 +72,10 @@ enum Image {
     Raster(Raster<Rgba8p>),
 }
 
-struct Background(Rgba8p);
-
-struct BackgroundError();
-
-impl TryFrom<Cow<'_, str>> for Background {
-    type Error = BackgroundError;
-
-    fn try_from(value: Cow<'_, str>) -> Result<Self, Self::Error> {
-        if value.len() != 6 {
-            return Err(BackgroundError());
-        }
-
-        value
-            .chars()
-            .chunks(2)
-            .into_iter()
-            .map(Iterator::collect::<String>)
-            .map(|c| u8::from_str_radix(&c, 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|_| BackgroundError())
-            .map(|rgb| Self(Rgba8p::new(rgb[0], rgb[1], rgb[2], 255)))
-    }
-}
-
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
-    sources_with_limits: &'static Vec<SourceWithLimits>,
+    context: &'static Context,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
     if req.method() != Method::GET {
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
@@ -116,15 +93,15 @@ pub async fn handle_request(
         parts.get(2).map(|v| v.parse::<u32>().ok()).flatten(),
     );
 
-    let mut background = Background(Rgba8p::new(255, 255, 255, 255));
+    let mut background = Cow::Borrowed(&context.default_background);
 
     let mut fallback_missing = false;
 
     for pair in url.query_pairs() {
         match pair.0.as_ref() {
             "background" | "bg" => {
-                background = match pair.1.try_into() {
-                    Ok(bg) => bg,
+                background = match pair.1.parse::<Background>() {
+                    Ok(bg) => Cow::Owned(bg),
                     Err(_) => return http_error(StatusCode::BAD_REQUEST),
                 }
             }
@@ -141,9 +118,9 @@ pub async fn handle_request(
                 let y = (1 << zoom) - 1 - y;
 
                 SOURCE_CONNECTIONS.with_borrow_mut(|source_connections| {
-                    let mut iter = sources_with_limits.iter();
+                    let mut iter = context.sources.iter();
 
-                    let tile_data = loop {
+                    let tile_data = 'out: loop {
                         let Some(source_with_limits) = iter.next() else {
                             break None; // no source at all
                         };
@@ -154,17 +131,30 @@ pub async fn handle_request(
                             break Some(tile_data);
                         };
 
-                        if zoom == 20 && !source_with_limits.limits.contains_key(&20) {
-                            if let Some(tile_data) = get_tile_data(
+                        let mut zoom = zoom;
+                        let mut n = 0;
+
+                        while zoom > 0 && n < 8 && !source_with_limits.limits.contains_key(&zoom) {
+                            zoom -= 1;
+                            n += 1;
+
+                            let tile_data = get_tile_data(
                                 source_with_limits,
                                 source_connections,
-                                zoom - 1,
-                                x / 2,
-                                y / 2,
-                            )? {
-                                let quad = (1 + (x % 2) + 2 * (y % 2)) as u8;
+                                zoom,
+                                x >> n,
+                                y >> n,
+                            )?;
 
-                                break Some(TileData { quad, ..tile_data });
+                            if let Some(tile_data) = tile_data {
+                                break 'out Some(TileData {
+                                    shift: Some(TileShift {
+                                        x: (x & ((1 << n) - 1)) as u8,
+                                        y: (y & ((1 << n) - 1)) as u8,
+                                        level: n,
+                                    }),
+                                    ..tile_data
+                                });
                             }
                         }
                     };
@@ -194,13 +184,13 @@ pub async fn handle_request(
                         };
                     };
 
-                    let mut image = if tile_data.alpha.is_empty() && tile_data.quad == 0 {
+                    let mut image = if tile_data.alpha.is_empty() && tile_data.shift.is_none() {
                         Image::Raw(tile_data.rgb) // no recompression
                     } else {
                         Image::Raster(to_raster(
                             &tile_data.rgb,
                             decompress_tile_alpha(&tile_data.alpha)?,
-                            tile_data.quad,
+                            &tile_data.shift,
                         )?)
                     };
 
@@ -215,7 +205,7 @@ pub async fn handle_request(
                             let raster = to_raster(
                                 &rgb,
                                 decompress_tile_alpha(&tile_data.alpha)?,
-                                tile_data.quad,
+                                &tile_data.shift,
                             )?;
 
                             image = Image::Raster(raster);
@@ -261,7 +251,7 @@ pub async fn handle_request(
                             }
                         }
 
-                        let src = to_raster(&tile_data2.rgb, tile_alpha2, tile_data2.quad)?;
+                        let src = to_raster(&tile_data2.rgb, tile_alpha2, &tile_data2.shift)?;
 
                         dst.composite_raster((0, 0, 256, 256), &src, (0, 0, 256, 256), SrcOver);
                     }
@@ -364,9 +354,9 @@ fn get_tile_data(
 
     let tile_data = if let Some(row) = rows.next()? {
         Some(TileData {
-            quad: 0,
             rgb: row.get::<_, Vec<u8>>(0)?,
             alpha: row.get::<_, Vec<u8>>(1)?,
+            shift: None,
         })
     } else {
         None
@@ -376,17 +366,19 @@ fn get_tile_data(
 }
 
 fn decompress_tile_alpha(tile_alpha: &[u8]) -> Result<Vec<u8>, ProcessingError> {
-    Ok(if tile_alpha.is_empty() {
+    let tile_alpha = if tile_alpha.is_empty() {
         vec![255; 256 * 256]
     } else {
         zstd::stream::decode_all(tile_alpha)?
-    })
+    };
+
+    Ok(tile_alpha)
 }
 
 fn to_raster(
     tile_data: &[u8],
     tile_alpha: Vec<u8>,
-    quad: u8,
+    shift: &Option<TileShift>,
 ) -> Result<Raster<Rgba8p>, ProcessingError> {
     let (w, h, tile_data) = decode_jpeg(tile_data)?;
 
@@ -398,20 +390,16 @@ fn to_raster(
 
     let raster = Raster::<Rgba8p>::with_raster(&Raster::<Rgba8>::with_u8_buffer(w, h, tile));
 
-    let raster = if quad == 0 {
-        raster
+    let raster = if let Some(shift) = shift {
+        scale_and_crop(raster, shift)
     } else {
-        scale_and_crop(
-            raster,
-            ((quad as u32 - 1) & 1) * 256,
-            256 - ((quad as u32 - 1) / 2 & 1) * 256,
-        )
+        raster
     };
 
     Ok(raster)
 }
 
-fn scale_and_crop(raster: Raster<Rgba8p>, ox: u32, oy: u32) -> Raster<Rgba8p> {
+fn scale_and_crop<'a>(raster: Raster<Rgba8p>, shift: &TileShift) -> Raster<Rgba8p> {
     // Step 1: Convert `pix` raster to `image` buffer
     let width = raster.width() as u32;
     let height = raster.height() as u32;
@@ -430,15 +418,21 @@ fn scale_and_crop(raster: Raster<Rgba8p>, ox: u32, oy: u32) -> Raster<Rgba8p> {
             ])
         });
 
+    // we are not croppig first for the better quality
+    // TODO can create huge images fir bigger levels; in that case crop first
+
     // Step 2: Resize using `image` crate
     let resized_image = DynamicImage::ImageRgba8(image_buffer).resize_exact(
-        512,
-        512,
+        256 << shift.level,
+        256 << shift.level,
         image::imageops::FilterType::Lanczos3,
     );
 
+    let ox = (shift.x as u32) << (9 - shift.level);
+    let oy = (shift.y as u32) << (9 - shift.level);
+
     // Step 3: Crop the top-left 256x256 corner
-    let cropped_image = resized_image.crop_imm(ox, oy, 256, 256);
+    let cropped_image = resized_image.crop_imm(ox, (256_u32 << (shift.level - 1)) - oy, 256, 256);
 
     // Step 4: Convert back to `pix` raster
     let cropped_raster = Raster::<Rgba8p>::with_pixels(

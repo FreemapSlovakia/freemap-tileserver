@@ -2,6 +2,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::background::Background;
+
 #[derive(Serialize, Deserialize)]
 pub struct SourceLimits {
     pub min_x: u32,
@@ -15,10 +17,19 @@ pub struct SourceWithLimits {
     pub limits: HashMap<u8, SourceLimits>,
 }
 
+pub struct TileShift {
+    pub x: u8,
+    pub y: u8,
+    pub level: u8,
+}
+
 pub struct TileData {
-    /// 1 2<br>
-    /// 3 4
-    pub quad: u8,
     pub rgb: Vec<u8>,
     pub alpha: Vec<u8>,
+    pub shift: Option<TileShift>,
+}
+
+pub struct Context {
+    pub sources: Vec<SourceWithLimits>,
+    pub default_background: Background,
 }

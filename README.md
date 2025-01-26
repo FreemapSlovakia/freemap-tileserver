@@ -18,6 +18,8 @@ Options:
           Address to listen on [default: 127.0.0.1:3003]
   -s, --source <SOURCE>
           Source file, can be specified multiple times (order matters)
+  -d, --default-background <DEFAULT_BACKGROUND>
+          Default background color [default: ffffff]
   -h, --help
           Print help
   -V, --version
@@ -36,4 +38,3 @@ Query parameters:
 
 - `bg=RRGGBB` - Background color. Default is white.
 - `fallback_missing` - Fallback missing tile to empty tile of background color. Default is to return 404.
-- `upscale`
