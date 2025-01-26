@@ -12,31 +12,32 @@ use pix::{
     Raster,
 };
 use rusqlite::{Connection, OpenFlags};
-use std::{
-    borrow::Cow,
-    cell::RefCell,
-    collections::HashMap,
-    convert::Infallible,
-    io::Cursor,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{borrow::Cow, cell::RefCell, convert::Infallible, io::Cursor, path::Path, sync::Arc};
 use tokio::{runtime::Runtime, task::JoinError};
 use url::Url;
 
-use crate::structs::SourceLimits;
+use crate::structs::{SourceWithLimits, TileData};
+
+struct SourceConnection<'a> {
+    source: &'a Path,
+    connection: Connection,
+}
 
 thread_local! {
-    static THREAD_LOCAL_DATA: RefCell<Vec<(&Path, Connection)>> = const {RefCell::new(Vec::new())};
+    static SOURCE_CONNECTIONS: RefCell<Vec<SourceConnection>> = const {RefCell::new(Vec::new())};
 }
+
+// TODO cfg
+const JPEG_QUALITY: u8 = 85;
 
 #[derive(thiserror::Error, Debug)]
 enum ProcessingError {
     #[error("join error")]
     JoinError(#[from] JoinError),
 
-    // #[error("HTTP error")]
-    // HttpError(StatusCode, Option<&'static str>),
+    #[error("HTTP error")]
+    HttpError(StatusCode, Option<&'static str>),
+
     #[error("image encoding error: {0}")]
     ImageEncodingError(#[from] ImageError),
 
@@ -97,7 +98,7 @@ impl TryFrom<Cow<'_, str>> for Background {
 pub async fn handle_request(
     pool: Arc<Runtime>,
     req: Request<Incoming>,
-    sources: &'static Vec<(PathBuf, HashMap<u8, SourceLimits>)>,
+    sources: &'static Vec<SourceWithLimits>,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
     if req.method() != Method::GET {
         return http_error(StatusCode::METHOD_NOT_ALLOWED);
@@ -117,6 +118,8 @@ pub async fn handle_request(
 
     let mut background = Background(Rgba8p::new(255, 255, 255, 255));
 
+    let mut fallback_missing = false;
+
     for pair in url.query_pairs() {
         match pair.0.as_ref() {
             "background" | "bg" => {
@@ -124,6 +127,9 @@ pub async fn handle_request(
                     Ok(bg) => bg,
                     Err(_) => return http_error(StatusCode::BAD_REQUEST),
                 }
+            }
+            "fallback_missing" => {
+                fallback_missing = true;
             }
             _ => {}
         }
@@ -134,65 +140,72 @@ pub async fn handle_request(
             .spawn_blocking(move || {
                 let y = (1 << zoom) - 1 - y;
 
-                THREAD_LOCAL_DATA.with_borrow_mut(|data| {
+                SOURCE_CONNECTIONS.with_borrow_mut(|source_connections| {
                     let mut iter = sources.iter();
 
-                    let tile = loop {
+                    let tile_data = loop {
                         let Some(source) = iter.next() else {
-                            break None;
+                            break None; // no source at all
                         };
 
-                        let Some((tile_data, tile_alpha)) = get_blobs(source, data, zoom, x, y)?
-                        else {
-                            continue;
+                        if let Some(tile_data) =
+                            get_tile_data(source, source_connections, zoom, x, y)?
+                        {
+                            break Some(tile_data);
                         };
 
-                        break Some((tile_data, tile_alpha));
+                        get_tile_data(source, source_connections, zoom - 1, x / 2, y / 2)?;
                     };
 
-                    let Some((tile_data, tile_alpha)) = tile else {
+                    let Some(tile_data) = tile_data else {
                         // if let Some((tile_data, tile_alpha)) =
                         //     get_blobs(source, data, zoom - 1, x / 2, y / 2)?
                         // {
                         // }
 
-                        let mut out = vec![];
+                        return if fallback_missing {
+                            let mut out = vec![];
 
-                        let empty: Vec<u8> = background
-                            .0
-                            .channels()
-                            .iter()
-                            .take(3)
-                            .map(|ch| -> u8 { (*ch).into() })
-                            .collect();
+                            let empty: Vec<u8> = background
+                                .0
+                                .channels()
+                                .iter()
+                                .take(3)
+                                .map(|ch| -> u8 { (*ch).into() })
+                                .collect();
 
-                        jpeg_encoder::Encoder::new(&mut out, 90 /* TODO cfg */).encode(
-                            &empty.repeat(256 * 256),
-                            256,
-                            256,
-                            jpeg_encoder::ColorType::Rgb,
-                        )?;
+                            jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY).encode(
+                                &empty.repeat(256 * 256),
+                                256,
+                                256,
+                                jpeg_encoder::ColorType::Rgb,
+                            )?;
 
-                        return Ok(Bytes::from(out));
-
-                        // return Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None));
+                            Ok(Bytes::from(out))
+                        } else {
+                            Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None))
+                        };
                     };
 
-                    let mut image = if tile_alpha.is_empty() {
-                        Image::Raw(tile_data)
+                    let mut image = if tile_data.alpha.is_empty() {
+                        Image::Raw(tile_data.rgb)
                     } else {
-                        Image::Raster(to_raster(&tile_data, decompress_tile_alpha(&tile_alpha)?)?)
+                        Image::Raster(to_raster(
+                            &tile_data.rgb,
+                            decompress_tile_alpha(&tile_data.alpha)?,
+                        )?)
                     };
 
                     for source in iter {
-                        let Some((tile_data2, tile_alpha2)) = get_blobs(source, data, zoom, x, y)?
+                        let Some(tile_data2) =
+                            get_tile_data(source, source_connections, zoom, x, y)?
                         else {
                             continue;
                         };
 
                         if let Image::Raw(tile_data) = image {
                             let raster =
-                                to_raster(&tile_data, decompress_tile_alpha(&tile_alpha)?)?;
+                                to_raster(&tile_data, decompress_tile_alpha(&tile_data2.alpha)?)?;
 
                             image = Image::Raster(raster);
                         }
@@ -201,7 +214,7 @@ pub async fn handle_request(
                             panic!("reached unreachable");
                         };
 
-                        let mut tile_alpha2 = decompress_tile_alpha(&tile_alpha2)?;
+                        let mut tile_alpha2 = decompress_tile_alpha(&tile_data2.alpha)?;
 
                         // this is to remove darkened borders caused by lanczos data+mask resizing
                         if zoom > 7 {
@@ -237,7 +250,7 @@ pub async fn handle_request(
                             }
                         }
 
-                        let src = to_raster(&tile_data2, tile_alpha2)?;
+                        let src = to_raster(&tile_data2.rgb, tile_alpha2)?;
 
                         dst.composite_raster((0, 0, 256, 256), &src, (0, 0, 256, 256), SrcOver);
                     }
@@ -251,7 +264,7 @@ pub async fn handle_request(
 
                             let raster = Raster::<Rgba8>::with_raster(&raster);
 
-                            jpeg_encoder::Encoder::new(&mut out, 90 /* TODO cfg */).encode(
+                            jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY).encode(
                                 raster.as_u8_slice(),
                                 raster.width() as u16,
                                 raster.height() as u16,
@@ -268,13 +281,13 @@ pub async fn handle_request(
             .and_then(|inner_result| inner_result)
             .map_or_else(
                 |e| {
-                    // if let ProcessingError::HttpError(sc, message) = e {
-                    //     http_error_msg(sc, message.unwrap_or_else(|| sc.as_str()))
-                    // } else {
-                    eprintln!("Error: {e}");
+                    if let ProcessingError::HttpError(sc, message) = e {
+                        http_error_msg(sc, message.unwrap_or_else(|| sc.as_str()))
+                    } else {
+                        eprintln!("Error: {e}");
 
-                    http_error(StatusCode::INTERNAL_SERVER_ERROR)
-                    // }
+                        http_error(StatusCode::INTERNAL_SERVER_ERROR)
+                    }
                 },
                 |data| {
                     Response::builder()
@@ -303,31 +316,33 @@ fn http_error_msg(
     )
 }
 
-fn get_blobs(
-    source: &'static (PathBuf, HashMap<u8, SourceLimits>),
-    data: &mut Vec<(&Path, Connection)>,
+fn get_tile_data(
+    source_with_limits: &'static SourceWithLimits,
+    source_connections: &mut Vec<SourceConnection>,
     zoom: u8,
     x: u32,
     y: u32,
-) -> rusqlite::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let Some(limits) = source.1.get(&zoom) else {
+) -> rusqlite::Result<Option<TileData>> {
+    let Some(limits) = source_with_limits.limits.get(&zoom) else {
         return Ok(None);
     };
 
-    if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
+    let ry = (1 << zoom) - 1 - y;
+
+    if x < limits.min_x || x > limits.max_x || ry < limits.min_y || ry > limits.max_y {
         return Ok(None);
     }
 
-    let source = source.0.as_path();
+    let source = source_with_limits.source.as_path();
 
-    let conn = if let Some(index) = data.iter().position(|a| a.0 == source) {
-        &data[index].1
+    let conn = if let Some(index) = source_connections.iter().position(|a| a.source == source) {
+        &source_connections[index].connection
     } else {
-        data.push((
+        source_connections.push(SourceConnection {
             source,
-            Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
-        ));
-        &data.last().unwrap().1
+            connection: Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+        });
+        &source_connections.last().unwrap().connection
     };
 
     let mut stmt = conn.prepare(concat!(
@@ -338,11 +353,16 @@ fn get_blobs(
 
     let mut rows = stmt.query((zoom, x, y))?;
 
-    Ok(if let Some(row) = rows.next()? {
-        Some((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    let tile_data = if let Some(row) = rows.next()? {
+        Some(TileData {
+            rgb: row.get::<_, Vec<u8>>(0)?,
+            alpha: row.get::<_, Vec<u8>>(1)?,
+        })
     } else {
         None
-    })
+    };
+
+    Ok(tile_data)
 }
 
 fn decompress_tile_alpha(tile_alpha: &[u8]) -> Result<Vec<u8>, ProcessingError> {

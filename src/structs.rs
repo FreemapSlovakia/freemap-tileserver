@@ -1,3 +1,5 @@
+use std::{collections::HashMap, path::PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -6,4 +8,14 @@ pub struct SourceLimits {
     pub max_x: u32,
     pub min_y: u32,
     pub max_y: u32,
+}
+
+pub struct SourceWithLimits {
+    pub source: PathBuf,
+    pub limits: HashMap<u8, SourceLimits>,
+}
+
+pub struct TileData {
+    pub rgb: Vec<u8>,
+    pub alpha: Vec<u8>,
 }

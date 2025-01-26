@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     thread,
 };
-use structs::SourceLimits;
+use structs::{SourceLimits, SourceWithLimits};
 use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
@@ -53,14 +53,11 @@ async fn main() -> Result<()> {
                 )
                 .ok();
 
-            let source_limits = match limits {
-                Some(limits) => {
-                    let source_limits: HashMap<u8, SourceLimits> =
-                        serde_json::from_str(&limits).unwrap(); // TODO
-
-                    source_limits
-                }
+            let limits = match limits {
+                Some(limits) => serde_json::from_str::<HashMap<u8, SourceLimits>>(&limits).unwrap(), // TODO unwrap
                 None => {
+                    // compute limits
+
                     let mut stmt = conn.prepare(concat!(
                         "SELECT ",
                         "zoom_level, ",
@@ -91,7 +88,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            Ok((source, source_limits))
+            Ok(SourceWithLimits { source, limits })
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 

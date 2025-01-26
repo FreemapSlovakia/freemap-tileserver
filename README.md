@@ -30,4 +30,10 @@ Generate sources with [`freemap-tiler`](https://github.com/FreemapSlovakia/freem
 
 ## URL
 
-URL uses slippy map schema `/{zoom}/{x}/{y}[.jpg][?bg=RRGGBB]`. Default background color is white.
+URL uses slippy map schema `/{zoom}/{x}/{y}[.jpg]
+
+Query parameters:
+
+- `bg=RRGGBB` - Background color. Default is white.
+- `fallback_missing` - Fallback missing tile to empty tile of background color. Default is to return 404.
+- `upscale`
