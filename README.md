@@ -1,5 +1,12 @@
 # Freemap Tileserver
 
+Tileserver for MBTiles with Freemap extensions.
+
+Supports:
+
+- seamless blending of multiple raster sources
+- overzooming for sources not having tiles of highest zoom levels
+
 ## Building and installing
 
 ```sh
