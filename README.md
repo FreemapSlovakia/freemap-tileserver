@@ -2,7 +2,7 @@
 
 Tileserver for MBTiles with Freemap extensions.
 
-Supports:
+Features:
 
 - seamless blending of multiple raster sources
 - overzooming for sources not having tiles of highest zoom levels
