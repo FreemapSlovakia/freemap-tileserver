@@ -11,14 +11,7 @@ use hyper_util::rt::TokioIo;
 use pix::rgb::Rgba8p;
 use request_handler::handle_request;
 use rusqlite::{Connection, OpenFlags};
-use std::{
-    collections::HashMap,
-    io::{stdout, Write},
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    thread,
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, thread};
 use structs::{Context, SourceLimits, SourceWithLimits};
 use tokio::net::TcpListener;
 
@@ -36,15 +29,17 @@ struct Args {
     /// Default background color
     #[arg(short, long, default_value_t = Background(Rgba8p::new(255, 255, 255, 255)))]
     default_background: Background,
+
+    /// Skip computing bounds if missing
+    #[arg(short, long, default_value_t = false)]
+    skip_fallback_bounds_computation: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    print!("Querying boundaries ...");
-
-    stdout().flush()?;
+    println!("Querying bounds");
 
     let sources = args
         .source
@@ -60,10 +55,14 @@ async fn main() -> Result<()> {
                 )
                 .ok();
 
-            let limits = match limits {
-                Some(limits) => serde_json::from_str::<HashMap<u8, SourceLimits>>(&limits).unwrap(), // TODO unwrap
-                None => {
+            let limits = match (limits, args.skip_fallback_bounds_computation) {
+                (Some(limits), _) => {
+                    Some(serde_json::from_str::<HashMap<u8, SourceLimits>>(&limits).unwrap())
+                }
+                (None, false) => {
                     // compute limits
+
+                    println!("Computing bounds");
 
                     let mut stmt = conn.prepare(concat!(
                         "SELECT ",
@@ -91,15 +90,14 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    source_limits
+                    Some(source_limits)
                 }
+                _ => None,
             };
 
             Ok(SourceWithLimits { source, limits })
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-
-    println!(" done.");
 
     // Create a dedicated Tokio runtime for Dataset tasks.
     let dataset_runtime = Arc::new(

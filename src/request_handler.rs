@@ -128,13 +128,14 @@ pub async fn handle_request(
                                 return Ok(Some(tile_data));
                             };
 
+                            let Some(limits) = source_with_limits.limits.as_ref() else {
+                                return Ok(None);
+                            };
+
                             let mut zoom = zoom;
                             let mut n = 0;
 
-                            while zoom > 0
-                                && n < 8
-                                && !source_with_limits.limits.contains_key(&zoom)
-                            {
+                            while zoom > 0 && n < 8 && !limits.contains_key(&zoom) {
                                 zoom -= 1;
                                 n += 1;
 
@@ -339,12 +340,14 @@ fn get_tile_data(
     x: u32,
     y: u32,
 ) -> rusqlite::Result<Option<TileData>> {
-    let Some(limits) = source_with_limits.limits.get(&zoom) else {
-        return Ok(None);
-    };
+    if let Some(limits) = &source_with_limits.limits {
+        let Some(limits) = limits.get(&zoom) else {
+            return Ok(None);
+        };
 
-    if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
-        return Ok(None);
+        if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
+            return Ok(None);
+        }
     }
 
     let source = source_with_limits.source.as_path();

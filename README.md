@@ -20,6 +20,8 @@ Options:
           Source file, can be specified multiple times (order matters)
   -d, --default-background <DEFAULT_BACKGROUND>
           Default background color [default: ffffff]
+  -s, --skip-fallback-bounds-computation
+          Skip computing bounds if missing
   -h, --help
           Print help
   -V, --version

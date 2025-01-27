@@ -14,7 +14,7 @@ pub struct SourceLimits {
 
 pub struct SourceWithLimits {
     pub source: PathBuf,
-    pub limits: HashMap<u8, SourceLimits>,
+    pub limits: Option<HashMap<u8, SourceLimits>>,
 }
 
 pub struct TileShift {
