@@ -41,7 +41,7 @@ Generate sources with [`freemap-tiler`](https://github.com/FreemapSlovakia/freem
 
 ## URL
 
-URL uses slippy map schema `/{zoom}/{x}/{y}[.jpg]
+URL uses slippy map schema `/{zoom}/{x}/{y}[.jpg]`.
 
 Query parameters:
 
