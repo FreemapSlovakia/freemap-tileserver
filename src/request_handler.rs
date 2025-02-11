@@ -7,12 +7,8 @@ use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response, StatusCode,
 };
-use image::{codecs::jpeg::JpegDecoder, DynamicImage, ImageBuffer, ImageDecoder, ImageError, Rgba};
-use pix::{
-    el::Pixel,
-    ops::{DestOver, SrcOver},
-    rgb::{Rgba8, Rgba8p},
-    Raster,
+use image::{
+    imageops::crop_imm, DynamicImage, ImageError, ImageReader, Pixel, RgbImage, RgbaImage,
 };
 use rusqlite::{Connection, OpenFlags};
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, io::Cursor, path::Path, sync::Arc};
@@ -69,7 +65,7 @@ pub enum BodyError {
 
 enum Image {
     Raw(Vec<u8>),
-    Raster(Raster<Rgba8p>),
+    Raster(RgbaImage),
 }
 
 pub async fn handle_request(
@@ -234,55 +230,118 @@ pub async fn handle_request(
                         let mut tile_alpha2 = decompress_tile_alpha(&tile_data2.alpha)?;
 
                         // this is to remove darkened borders caused by lanczos data+mask resizing
-                        if zoom > 6 {
-                            let mut to_change = vec![0u8; tile_alpha2.len()];
+                        let mut to_change = vec![0u8; tile_alpha2.len()];
 
-                            for x in 0..256_usize {
-                                for y in 0..256_usize {
-                                    let alpha: u8 = dst.pixel(x as i32, y as i32).alpha().into();
+                        for x in 0..dst.width() {
+                            for y in 0..dst.height() {
+                                if dst.get_pixel(x as u32, y as u32)[3] > 128
+                                    && tile_alpha2[x as usize + y as usize * dst.width() as usize]
+                                        < 128
+                                {
+                                    for ny in -2..=2_i32 {
+                                        for nx in -2..=2_i32 {
+                                            let val = (nx.abs() + ny.abs()) as u8;
 
-                                    if alpha > 128 && tile_alpha2[x + y * 256] < 128 {
-                                        for ny in -2..=2_i32 {
-                                            for nx in -2..=2_i32 {
-                                                let val = (nx.abs() + ny.abs()) as u8;
+                                            let index = ((y as i32 + ny).clamp(0, 255) * 256
+                                                + (x as i32 + nx).clamp(0, 255))
+                                                as usize;
 
-                                                let index = ((y as i32 + ny).clamp(0, 255) * 256
-                                                    + (x as i32 + nx).clamp(0, 255))
-                                                    as usize;
-
-                                                to_change[index] =
-                                                    to_change[index].max(match val {
-                                                        0..=1 => 7,
-                                                        2 => 1,
-                                                        3.. => 0,
-                                                    });
-                                            }
+                                            to_change[index] = to_change[index].max(match val {
+                                                0..=1 => 7,
+                                                2 => 1,
+                                                3.. => 0,
+                                            });
                                         }
                                     }
                                 }
                             }
+                        }
 
-                            for i in 0..tile_alpha2.len() {
-                                tile_alpha2[i] >>= to_change[i];
-                            }
+                        for i in 0..tile_alpha2.len() {
+                            tile_alpha2[i] >>= to_change[i];
                         }
 
                         let src = to_raster(&tile_data2.rgb, tile_alpha2, &tile_data2.shift)?;
 
-                        dst.composite_raster((0, 0, 256, 256), &src, (0, 0, 256, 256), SrcOver);
+                        for (dst, src) in dst.pixels_mut().zip(src.pixels()) {
+                            dst.blend(src);
+                        }
+
+                        let mut template: Option<RgbaImage> = None;
+
+                        for x in 0..256 {
+                            'main: for y in 0..256 {
+                                if template.as_ref().unwrap_or(dst).get_pixel(x, y)[3] == 255 {
+                                    continue;
+                                }
+
+                                let mut r = 0;
+                                let mut g = 0;
+                                let mut b = 0;
+                                let mut a = 0;
+
+                                for ny in -2..=2_i32 {
+                                    for nx in -2..=2_i32 {
+                                        let xx = x as i32 + nx;
+                                        let yy = y as i32 + ny;
+
+                                        if xx < 0 || xx > 255 || yy < 0 || yy > 255 {
+                                            continue;
+                                        }
+
+                                        let px = template
+                                            .as_ref()
+                                            .unwrap_or(dst)
+                                            .get_pixel(xx as u32, yy as u32);
+
+                                        if nx != 0 && ny != 0 && px[3] == 0 {
+                                            continue 'main;
+                                        }
+
+                                        if nx.abs() < 2 && ny.abs() < 2 {
+                                            let alpha = px[3] as u32;
+
+                                            r += px[0] as u32 * alpha;
+                                            g += px[1] as u32 * alpha;
+                                            b += px[2] as u32 * alpha;
+                                            a += alpha;
+                                        }
+                                    }
+                                }
+
+                                if a > 0 {
+                                    if template.is_none() {
+                                        template.replace(dst.clone());
+                                    }
+
+                                    dst.get_pixel_mut(x, y)[0] = (r / a) as u8;
+                                    dst.get_pixel_mut(x, y)[1] = (g / a) as u8;
+                                    dst.get_pixel_mut(x, y)[2] = (b / a) as u8;
+                                    dst.get_pixel_mut(x, y)[3] = 255;
+                                }
+                            }
+                        }
                     }
 
                     match image {
                         Image::Raw(tile_data) => Ok(Bytes::from(tile_data)),
                         Image::Raster(mut raster) => {
+                            for px in raster.pixels_mut() {
+                                let mut bg = background.0.clone();
+
+                                bg.blend(px);
+
+                                *px = bg;
+                            }
+
+                            // raster.composite_color((0, 0, 256, 256), background.0, DestOver);
+
+                            // let raster = Raster::<Rgba8>::with_raster(&raster);
+
                             let mut out = vec![];
 
-                            raster.composite_color((0, 0, 256, 256), background.0, DestOver);
-
-                            let raster = Raster::<Rgba8>::with_raster(&raster);
-
                             jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY).encode(
-                                raster.as_u8_slice(),
+                                raster.as_raw(),
                                 raster.width() as u16,
                                 raster.height() as u16,
                                 jpeg_encoder::ColorType::Rgba, // ignores alpha
@@ -345,6 +404,8 @@ fn get_tile_data(
             return Ok(None);
         };
 
+        println!("{} {}", x, y);
+
         if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
             return Ok(None);
         }
@@ -371,11 +432,17 @@ fn get_tile_data(
     let mut rows = stmt.query((zoom, x, y))?;
 
     let tile_data = if let Some(row) = rows.next()? {
-        Some(TileData {
-            rgb: row.get::<_, Vec<u8>>(0)?,
-            alpha: row.get::<_, Vec<u8>>(1)?,
-            shift: None,
-        })
+        let rgb = row.get::<_, Vec<u8>>(0)?;
+
+        if rgb.len() == 0 {
+            None
+        } else {
+            Some(TileData {
+                rgb,
+                alpha: row.get::<_, Vec<u8>>(1)?,
+                shift: None,
+            })
+        }
     } else {
         None
     };
@@ -395,87 +462,62 @@ fn decompress_tile_alpha(tile_alpha: &[u8]) -> Result<Vec<u8>, ProcessingError> 
 
 fn to_raster(
     tile_data: &[u8],
-    tile_alpha: Vec<u8>,
+    alpha: Vec<u8>,
     shift: &Option<TileShift>,
-) -> Result<Raster<Rgba8p>, ProcessingError> {
-    let (w, h, tile_data) = decode_jpeg(tile_data)?;
+) -> Result<RgbaImage, ProcessingError> {
+    let rgb = decode_jpeg(tile_data)?;
 
-    let tile: Vec<_> = tile_data
-        .chunks_exact(3)
-        .zip(tile_alpha)
-        .flat_map(|(chunk, v2_item)| chunk.iter().copied().chain(std::iter::once(v2_item)))
+    assert_eq!(
+        rgb.width() * rgb.height(),
+        alpha.len() as u32,
+        "Alpha channel length must match the number of pixels"
+    );
+
+    let raw: Vec<u8> = rgb
+        .pixels()
+        .zip(alpha.into_iter())
+        .flat_map(|(pixel, a)| [pixel[0], pixel[1], pixel[2], a])
         .collect();
 
-    let raster = Raster::<Rgba8p>::with_raster(&Raster::<Rgba8>::with_u8_buffer(w, h, tile));
+    let rgba_image = RgbaImage::from_raw(rgb.width(), rgb.height(), raw).unwrap();
 
     let raster = if let Some(shift) = shift {
-        scale_and_crop(raster, shift)
+        scale_and_crop(rgba_image, shift)
     } else {
-        raster
+        rgba_image
     };
 
     Ok(raster)
 }
 
-fn scale_and_crop<'a>(raster: Raster<Rgba8p>, shift: &TileShift) -> Raster<Rgba8p> {
-    // Step 1: Convert `pix` raster to `image` buffer
-    let width = raster.width() as u32;
-    let height = raster.height() as u32;
-
-    let image_buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_fn(width, height, |x, y| {
-            let pixel = raster.pixel(x as i32, y as i32);
-
-            let rgba = pixel.channels();
-
-            Rgba([
-                rgba[0].into(),
-                rgba[1].into(),
-                rgba[2].into(),
-                rgba[3].into(),
-            ])
-        });
-
+fn scale_and_crop<'a>(raster: RgbaImage, shift: &TileShift) -> RgbaImage {
     // we are not croppig first for the better quality
-    // TODO can create huge images fir bigger levels; in that case crop first
+    // TODO can create huge images for bigger levels; in that case crop first
 
-    // Step 2: Resize using `image` crate
-    let resized_image = DynamicImage::ImageRgba8(image_buffer).resize_exact(
+    let raster = image::imageops::resize(
+        &raster,
         256 << shift.level,
         256 << shift.level,
         image::imageops::FilterType::Lanczos3,
     );
 
-    let ox = (shift.x as u32) << (9 - shift.level);
-    let oy = (shift.y as u32) << (9 - shift.level);
-
-    // Step 3: Crop the top-left 256x256 corner
-    let cropped_image = resized_image.crop_imm(ox, (256_u32 << (shift.level - 1)) - oy, 256, 256);
-
-    // Step 4: Convert back to `pix` raster
-    let cropped_raster = Raster::<Rgba8p>::with_pixels(
+    crop_imm(
+        &raster,
+        (shift.x as u32) << (9 - shift.level),
+        (256_u32 << (shift.level - 1)) - ((shift.y as u32) << (9 - shift.level)),
         256,
         256,
-        cropped_image
-            .to_rgba8()
-            .pixels()
-            .map(|p| Rgba8p::new(p[0], p[1], p[2], p[3]))
-            .collect::<Vec<_>>(),
-    );
-
-    cropped_raster
+    )
+    .to_image()
 }
 
-fn decode_jpeg(tile_data: &[u8]) -> Result<(u32, u32, Vec<u8>), ProcessingError> {
-    let cursor = Cursor::new(tile_data);
+fn decode_jpeg(tile_data: &[u8]) -> Result<RgbImage, ProcessingError> {
+    let image =
+        ImageReader::with_format(Cursor::new(tile_data), image::ImageFormat::Jpeg).decode()?;
 
-    let decoder = JpegDecoder::new(cursor)?;
-
-    let (w, h) = decoder.dimensions();
-
-    let mut tile_data = vec![0; decoder.total_bytes() as usize];
-
-    decoder.read_image(&mut tile_data)?;
-
-    Ok((w, h, tile_data))
+    if let DynamicImage::ImageRgb8(image) = image {
+        Ok(image)
+    } else {
+        Err(ProcessingError::ReadError("not ImageRgb8".into()))
+    }
 }

@@ -8,7 +8,7 @@ use background::Background;
 use clap::Parser;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use pix::rgb::Rgba8p;
+use image::Rgba;
 use request_handler::handle_request;
 use rusqlite::{Connection, OpenFlags};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, thread};
@@ -27,7 +27,7 @@ struct Args {
     source: Vec<PathBuf>,
 
     /// Default background color
-    #[arg(short, long, default_value_t = Background(Rgba8p::new(255, 255, 255, 255)))]
+    #[arg(short, long, default_value_t = Background(Rgba([255, 255, 255, 255])))]
     default_background: Background,
 
     /// Skip computing bounds if missing
@@ -89,6 +89,11 @@ async fn main() -> Result<()> {
                             },
                         );
                     }
+
+                    println!(
+                        "{}",
+                        serde_json::to_string(&source_limits).expect("Error serializing limits")
+                    );
 
                     Some(source_limits)
                 }

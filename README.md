@@ -47,3 +47,9 @@ Query parameters:
 
 - `bg=RRGGBB` - Background color. Default is white.
 - `fallback_missing` - Fallback missing tile to empty tile of background color. Default is to return 404.
+
+## Example
+
+```sh
+cargo run --release -- -s /media/martin/14TB/CZ-ORTOFOTO/mbtiles/vychod-v6-merged.mbtiles -s /home/martin/OSM/stred-with-mask.mbtiles -s /home/martin/OSM/vychod-with-mask.mbtiles -s /home/martin/OSM/zapad-w-a.mbtiles
+```

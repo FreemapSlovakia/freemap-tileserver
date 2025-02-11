@@ -2,12 +2,12 @@ use clap::{
     builder::{TypedValueParser, ValueParserFactory},
     error::ErrorKind,
 };
+use image::Rgba;
 use itertools::Itertools;
-use pix::{el::Pixel, rgb::Rgba8p};
 use std::{fmt::Display, str::FromStr};
 
 #[derive(Debug, Clone)]
-pub struct Background(pub Rgba8p);
+pub struct Background(pub Rgba<u8>);
 
 pub struct BackgroundError();
 
@@ -19,9 +19,9 @@ impl Display for BackgroundError {
 
 impl Display for Background {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let r: u8 = self.0.one().into();
-        let g: u8 = self.0.two().into();
-        let b: u8 = self.0.three().into();
+        let r: u8 = self.0[0];
+        let g: u8 = self.0[1];
+        let b: u8 = self.0[2];
 
         write!(f, "{:02x}{:02x}{:02x}", r, g, b)
     }
@@ -42,7 +42,7 @@ impl FromStr for Background {
             .map(|c| u8::from_str_radix(&c, 16))
             .collect::<Result<Vec<u8>, _>>()
             .map_err(|_| BackgroundError())
-            .map(|rgb| Self(Rgba8p::new(rgb[0], rgb[1], rgb[2], 255)))
+            .map(|rgb| Self(Rgba([rgb[0], rgb[1], rgb[2], 255])))
     }
 }
 
