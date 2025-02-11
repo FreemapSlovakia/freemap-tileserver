@@ -232,11 +232,14 @@ pub async fn handle_request(
                         // this is to remove darkened borders caused by lanczos data+mask resizing
                         let mut to_change = vec![0u8; tile_alpha2.len()];
 
-                        for x in 0..dst.width() {
-                            for y in 0..dst.height() {
+                        let width = dst.width();
+
+                        let height = dst.height();
+
+                        for x in 0..width {
+                            for y in 0..height {
                                 if dst.get_pixel(x as u32, y as u32)[3] > 128
-                                    && tile_alpha2[x as usize + y as usize * dst.width() as usize]
-                                        < 128
+                                    && tile_alpha2[x as usize + y as usize * width as usize] < 128
                                 {
                                     for ny in -2..=2_i32 {
                                         for nx in -2..=2_i32 {
@@ -269,8 +272,9 @@ pub async fn handle_request(
 
                         let mut template: Option<RgbaImage> = None;
 
-                        for x in 0..256 {
-                            'main: for y in 0..256 {
+                        // now remove ugly gaps of touching areas
+                        for x in 0..(width as u32) {
+                            'main: for y in 0..(height as u32) {
                                 if template.as_ref().unwrap_or(dst).get_pixel(x, y)[3] == 255 {
                                     continue;
                                 }
@@ -285,7 +289,11 @@ pub async fn handle_request(
                                         let xx = x as i32 + nx;
                                         let yy = y as i32 + ny;
 
-                                        if xx < 0 || xx > 255 || yy < 0 || yy > 255 {
+                                        if xx < 0
+                                            || xx > width as i32 - 1
+                                            || yy < 0
+                                            || yy > height as i32 - 1
+                                        {
                                             continue;
                                         }
 
@@ -333,10 +341,6 @@ pub async fn handle_request(
 
                                 *px = bg;
                             }
-
-                            // raster.composite_color((0, 0, 256, 256), background.0, DestOver);
-
-                            // let raster = Raster::<Rgba8>::with_raster(&raster);
 
                             let mut out = vec![];
 
