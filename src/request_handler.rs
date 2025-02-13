@@ -373,7 +373,6 @@ pub async fn handle_request(
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "image/jpeg")
-                        .header("Access-Control-Allow-Origin", "*")
                         .body(Full::new(data).map_err(|e| match e {}).boxed())
                 },
             ),
