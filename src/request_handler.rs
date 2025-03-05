@@ -368,6 +368,10 @@ pub async fn handle_request(
             .map_or_else(
                 |e| {
                     if let ProcessingError::HttpError(sc, message) = e {
+                        if context.verbosity >= 2 {
+                            println!("Responding empty");
+                        }
+
                         http_error_msg(sc, message.unwrap_or_else(|| sc.as_str()))
                     } else {
                         eprintln!("Error: {e}");
@@ -376,6 +380,10 @@ pub async fn handle_request(
                     }
                 },
                 |data| {
+                    if context.verbosity >= 2 {
+                        println!("Responding tile");
+                    }
+
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "image/jpeg")
