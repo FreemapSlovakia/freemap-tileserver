@@ -32,4 +32,5 @@ pub struct TileData {
 pub struct Context {
     pub sources: Vec<SourceWithLimits>,
     pub default_background: Background,
+    pub verbosity: u8,
 }

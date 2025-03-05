@@ -5,7 +5,7 @@ mod structs;
 
 use anyhow::Result;
 use background::Background;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use image::Rgba;
@@ -33,6 +33,10 @@ struct Args {
     /// Skip computing bounds if missing
     #[arg(short, long, default_value_t = false)]
     skip_fallback_bounds_computation: bool,
+
+    /// Verbose
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
 }
 
 #[tokio::main]
@@ -122,6 +126,7 @@ async fn main() -> Result<()> {
     let context: &'static Context = Box::leak(Box::new(Context {
         sources,
         default_background: Background::try_from(args.default_background)?,
+        verbosity: args.verbose,
     }));
 
     let listener = TcpListener::bind(args.listen_address).await?;

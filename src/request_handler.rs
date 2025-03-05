@@ -2,13 +2,13 @@ use crate::{
     background::Background,
     structs::{Context, SourceWithLimits, TileData, TileShift},
 };
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
-    body::{Bytes, Incoming},
     Method, Request, Response, StatusCode,
+    body::{Bytes, Incoming},
 };
 use image::{
-    imageops::crop_imm, DynamicImage, ImageError, ImageReader, Pixel, RgbImage, RgbaImage,
+    DynamicImage, ImageError, ImageReader, Pixel, RgbImage, RgbaImage, imageops::crop_imm,
 };
 use rusqlite::{Connection, OpenFlags};
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, io::Cursor, path::Path, sync::Arc};
@@ -118,9 +118,14 @@ pub async fn handle_request(
                         |source_connections: &mut Vec<SourceConnection>,
                          source_with_limits: &'static SourceWithLimits|
                          -> Result<Option<TileData>, rusqlite::Error> {
-                            if let Some(tile_data) =
-                                get_tile_data(source_with_limits, source_connections, zoom, x, y)?
-                            {
+                            if let Some(tile_data) = get_tile_data(
+                                source_with_limits,
+                                source_connections,
+                                zoom,
+                                x,
+                                y,
+                                context.verbosity,
+                            )? {
                                 return Ok(Some(tile_data));
                             };
 
@@ -141,6 +146,7 @@ pub async fn handle_request(
                                     zoom,
                                     x >> n,
                                     y >> n,
+                                    context.verbosity,
                                 )?;
 
                                 if let Some(tile_data) = tile_data {
@@ -401,13 +407,12 @@ fn get_tile_data(
     zoom: u8,
     x: u32,
     y: u32,
+    verbosity: u8,
 ) -> rusqlite::Result<Option<TileData>> {
     if let Some(limits) = &source_with_limits.limits {
         let Some(limits) = limits.get(&zoom) else {
             return Ok(None);
         };
-
-        println!("{} {}", x, y);
 
         if x < limits.min_x || x > limits.max_x || y < limits.min_y || y > limits.max_y {
             return Ok(None);
@@ -423,8 +428,13 @@ fn get_tile_data(
             source,
             connection: Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
         });
+
         &source_connections.last().unwrap().connection
     };
+
+    if verbosity >= 2 {
+        println!("Selecting");
+    }
 
     let mut stmt = conn.prepare(concat!(
         "SELECT tile_data, tile_alpha ",
@@ -432,7 +442,15 @@ fn get_tile_data(
         "WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3"
     ))?;
 
+    if verbosity >= 2 {
+        println!("Querying");
+    }
+
     let mut rows = stmt.query((zoom, x, y))?;
+
+    if verbosity >= 2 {
+        println!("Done selecting");
+    }
 
     let tile_data = if let Some(row) = rows.next()? {
         let rgb = row.get::<_, Vec<u8>>(0)?;
