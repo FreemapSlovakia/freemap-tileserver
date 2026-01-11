@@ -2,7 +2,7 @@ use crate::{
     background::Background,
     structs::{Context, SourceWithLimits, TileData, TileShift},
 };
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
@@ -73,8 +73,10 @@ pub async fn handle_request(
     req: Request<Incoming>,
     context: &'static Context,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
-    if req.method() != Method::GET {
-        return http_error(StatusCode::METHOD_NOT_ALLOWED);
+    let is_head = req.method() == Method::HEAD;
+
+    if req.method() != Method::GET && !is_head {
+        return http_error(false, StatusCode::METHOD_NOT_ALLOWED);
     }
 
     let url = Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
@@ -98,7 +100,7 @@ pub async fn handle_request(
             "background" | "bg" => {
                 background = match pair.1.parse::<Background>() {
                     Ok(bg) => Cow::Owned(bg),
-                    Err(_) => return http_error(StatusCode::BAD_REQUEST),
+                    Err(_) => return http_error(is_head, StatusCode::BAD_REQUEST),
                 }
             }
             "fallback_missing" => {
@@ -372,11 +374,11 @@ pub async fn handle_request(
                             println!("Responding empty");
                         }
 
-                        http_error_msg(sc, message.unwrap_or_else(|| sc.as_str()))
+                        http_error_msg(is_head, sc, message.unwrap_or_else(|| sc.as_str()))
                     } else {
                         eprintln!("Error: {e}");
 
-                        http_error(StatusCode::INTERNAL_SERVER_ERROR)
+                        http_error(is_head, StatusCode::INTERNAL_SERVER_ERROR)
                     }
                 },
                 |data| {
@@ -384,29 +386,46 @@ pub async fn handle_request(
                         println!("Responding tile");
                     }
 
-                    Response::builder()
+                    let builder = Response::builder()
                         .status(StatusCode::OK)
-                        .header("Content-Type", "image/jpeg")
-                        .body(Full::new(data).map_err(|e| match e {}).boxed())
+                        .header("Content-Type", "image/jpeg");
+
+                    if is_head {
+                        builder
+                            .header("Content-Length", data.len().to_string())
+                            .body(Empty::new().map_err(|e| match e {}).boxed())
+                    } else {
+                        builder.body(Full::new(data).map_err(|e| match e {}).boxed())
+                    }
                 },
             ),
-        _ => http_error(StatusCode::NOT_FOUND),
+        _ => http_error(is_head, StatusCode::NOT_FOUND),
     }
 }
 
-fn http_error(sc: StatusCode) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
-    http_error_msg(sc, sc.as_str())
+fn http_error(
+    is_head: bool,
+    sc: StatusCode,
+) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
+    http_error_msg(is_head, sc, sc.as_str())
 }
 
 fn http_error_msg(
+    is_head: bool,
     sc: StatusCode,
     message: &str,
 ) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
-    Response::builder().status(sc).body(
-        Full::new(Bytes::from(message.to_owned()))
-            .map_err(BodyError::Infillable)
-            .boxed(),
-    )
+    let builder = Response::builder().status(sc);
+
+    if is_head {
+        builder.body(Empty::new().map_err(BodyError::Infillable).boxed())
+    } else {
+        builder.body(
+            Full::new(Bytes::from(message.to_owned()))
+                .map_err(BodyError::Infillable)
+                .boxed(),
+        )
+    }
 }
 
 fn get_tile_data(
