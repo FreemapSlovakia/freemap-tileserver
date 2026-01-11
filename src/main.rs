@@ -107,11 +107,12 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
-    // Create a dedicated Tokio runtime for Dataset tasks.
+    let available_parallelism = thread::available_parallelism()?;
+
     let dataset_runtime = Arc::new(
-        tokio::runtime::Builder::new_current_thread()
-            // .worker_threads(1)
-            .max_blocking_threads(thread::available_parallelism()?.into())
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(available_parallelism.into())
+            .max_blocking_threads(available_parallelism.into())
             .enable_all()
             .on_thread_stop(|| {
                 println!("thread stopping");
