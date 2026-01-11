@@ -1,5 +1,4 @@
 mod background;
-mod bbox;
 mod request_handler;
 mod structs;
 
