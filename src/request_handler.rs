@@ -1,11 +1,13 @@
 use crate::{
     background::Background,
+    coverage::{MAX_UPSCALE, accepts_gzip},
     structs::{Context, SourceWithLimits, TileData, TileShift},
 };
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
+    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, VARY},
 };
 use image::{
     DynamicImage, ImageError, ImageReader, Pixel, RgbImage, RgbaImage, imageops::crop_imm,
@@ -26,6 +28,8 @@ thread_local! {
 
 // TODO cfg
 const JPEG_QUALITY: u8 = 85;
+
+const WEBP_QUALITY: f32 = 80.0;
 
 #[derive(thiserror::Error, Debug)]
 enum ProcessingError {
@@ -49,6 +53,9 @@ enum ProcessingError {
 
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
+
+    #[error("webp encoding error: {0:?}")]
+    WebpEncodingError(webp::WebPEncodingError),
 }
 
 impl From<&rusqlite::Error> for ProcessingError {
@@ -81,6 +88,36 @@ pub async fn handle_request(
 
     let url = Url::parse(&format!("http://localhost{}", req.uri())).unwrap();
 
+    if url.path() == "/coverage.bin" {
+        let Some(coverage) = context.coverage.get() else {
+            return http_error(is_head, StatusCode::SERVICE_UNAVAILABLE);
+        };
+
+        let gzip = accepts_gzip(
+            req.headers()
+                .get_all(ACCEPT_ENCODING)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+
+        let data: &'static [u8] = if gzip {
+            &coverage.gzipped
+        } else {
+            &coverage.raw
+        };
+
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(VARY, "Accept-Encoding");
+
+        if gzip {
+            builder = builder.header(CONTENT_ENCODING, "gzip");
+        }
+
+        return ok_body(builder, is_head, Bytes::from_static(data));
+    }
+
     let tile = url.path().get(1..).unwrap_or_default().replace(".jpg", "");
 
     let parts: Vec<_> = tile.split('/').collect();
@@ -95,6 +132,8 @@ pub async fn handle_request(
 
     let mut fallback_missing = false;
 
+    let mut alpha = false;
+
     for pair in url.query_pairs() {
         match pair.0.as_ref() {
             "background" | "bg" => {
@@ -105,6 +144,9 @@ pub async fn handle_request(
             }
             "fallback_missing" => {
                 fallback_missing = true;
+            }
+            "alpha" => {
+                alpha = true;
             }
             _ => {}
         }
@@ -138,7 +180,7 @@ pub async fn handle_request(
                             let mut zoom = zoom;
                             let mut n = 0;
 
-                            while zoom > 0 && n < 8 && !limits.contains_key(&zoom) {
+                            while zoom > 0 && n < MAX_UPSCALE && !limits.contains_key(&zoom) {
                                 zoom -= 1;
                                 n += 1;
 
@@ -180,8 +222,9 @@ pub async fn handle_request(
                         }
                     };
 
-                    let Some(tile_data) = tile_data else {
-                        return if fallback_missing {
+                    // a tile with nothing to show
+                    let missing = || {
+                        if fallback_missing {
                             let mut out = vec![];
 
                             let empty: Vec<u8> = background
@@ -199,10 +242,14 @@ pub async fn handle_request(
                                 jpeg_encoder::ColorType::Rgb,
                             )?;
 
-                            Ok(Bytes::from(out))
+                            Ok((Bytes::from(out), "image/jpeg"))
                         } else {
                             Err(ProcessingError::HttpError(StatusCode::NOT_FOUND, None))
-                        };
+                        }
+                    };
+
+                    let Some(tile_data) = tile_data else {
+                        return missing();
                     };
 
                     let mut image = if tile_data.alpha.is_empty() && tile_data.shift.is_none() {
@@ -340,8 +387,31 @@ pub async fn handle_request(
                     }
 
                     match image {
-                        Image::Raw(tile_data) => Ok(Bytes::from(tile_data)),
+                        Image::Raw(tile_data) => Ok((Bytes::from(tile_data), "image/jpeg")),
                         Image::Raster(mut raster) => {
+                            if alpha {
+                                let (see_through, visible) =
+                                    raster.pixels().fold((false, false), |(s, v), px| {
+                                        (s || px[3] < 255, v || px[3] > 0)
+                                    });
+
+                                if !visible {
+                                    return missing();
+                                }
+
+                                if see_through {
+                                    let out = webp::Encoder::from_rgba(
+                                        raster.as_raw(),
+                                        raster.width(),
+                                        raster.height(),
+                                    )
+                                    .encode_simple(false, WEBP_QUALITY)
+                                    .map_err(ProcessingError::WebpEncodingError)?;
+
+                                    return Ok((Bytes::copy_from_slice(&out), "image/webp"));
+                                }
+                            }
+
                             for px in raster.pixels_mut() {
                                 let mut bg = background.0.clone();
 
@@ -359,7 +429,7 @@ pub async fn handle_request(
                                 jpeg_encoder::ColorType::Rgba, // ignores alpha
                             )?;
 
-                            Ok(Bytes::from(out))
+                            Ok((Bytes::from(out), "image/jpeg"))
                         }
                     }
                 })
@@ -381,25 +451,34 @@ pub async fn handle_request(
                         http_error(is_head, StatusCode::INTERNAL_SERVER_ERROR)
                     }
                 },
-                |data| {
+                |(data, content_type)| {
                     if context.verbosity >= 2 {
                         println!("Responding tile");
                     }
 
                     let builder = Response::builder()
                         .status(StatusCode::OK)
-                        .header("Content-Type", "image/jpeg");
+                        .header(CONTENT_TYPE, content_type);
 
-                    if is_head {
-                        builder
-                            .header("Content-Length", data.len().to_string())
-                            .body(Empty::new().map_err(|e| match e {}).boxed())
-                    } else {
-                        builder.body(Full::new(data).map_err(|e| match e {}).boxed())
-                    }
+                    ok_body(builder, is_head, data)
                 },
             ),
         _ => http_error(is_head, StatusCode::NOT_FOUND),
+    }
+}
+
+/// `data` as the body, or only its length for HEAD.
+fn ok_body(
+    builder: hyper::http::response::Builder,
+    is_head: bool,
+    data: Bytes,
+) -> Result<Response<BoxBody<Bytes, BodyError>>, hyper::http::Error> {
+    if is_head {
+        builder
+            .header(CONTENT_LENGTH, data.len().to_string())
+            .body(Empty::new().map_err(|e| match e {}).boxed())
+    } else {
+        builder.body(Full::new(data).map_err(|e| match e {}).boxed())
     }
 }
 

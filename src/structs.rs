@@ -1,8 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::background::Background;
+use crate::{background::Background, coverage::Coverage};
 
 #[derive(Serialize, Deserialize)]
 pub struct SourceLimits {
@@ -33,4 +33,6 @@ pub struct Context {
     pub sources: Vec<SourceWithLimits>,
     pub default_background: Background,
     pub verbosity: u8,
+    /// Unset until computed or loaded in the background.
+    pub coverage: OnceLock<Coverage>,
 }

@@ -1,4 +1,5 @@
 mod background;
+mod coverage;
 mod request_handler;
 mod structs;
 
@@ -10,7 +11,14 @@ use hyper_util::rt::TokioIo;
 use image::Rgba;
 use request_handler::handle_request;
 use rusqlite::{Connection, OpenFlags};
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, thread};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    thread,
+    time::Duration,
+};
 use structs::{Context, SourceLimits, SourceWithLimits};
 use tokio::net::TcpListener;
 
@@ -32,6 +40,18 @@ struct Args {
     /// Skip computing bounds if missing
     #[arg(short, long, default_value_t = false)]
     skip_fallback_bounds_computation: bool,
+
+    /// Deepest zoom of the coverage quadtree served at `/coverage.bin`
+    #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u8).range(0..=20))]
+    coverage_zoom: u8,
+
+    /// Deepest zoom clients request; coverage calls a tile full only if its source is served that deep
+    #[arg(long, default_value_t = 20)]
+    coverage_full_to: u8,
+
+    /// File to keep the coverage in across restarts; recomputed when the sources change
+    #[arg(long)]
+    coverage_cache: Option<PathBuf>,
 
     /// Verbose
     #[arg(short, long, action = ArgAction::Count)]
@@ -107,6 +127,15 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
+    // the tile handler upscales only a source it has limits for
+    let coverage_sources: Vec<_> = sources
+        .iter()
+        .map(|source| coverage::CoverageSource {
+            path: source.source.clone(),
+            upscaled: source.limits.is_some(),
+        })
+        .collect();
+
     let available_parallelism = thread::available_parallelism()?;
 
     let dataset_runtime = Arc::new(
@@ -127,7 +156,31 @@ async fn main() -> Result<()> {
         sources,
         default_background: Background::try_from(args.default_background)?,
         verbosity: args.verbose,
+        coverage: OnceLock::new(),
     }));
+
+    // Reading the coverage from multi-TB sources takes minutes, so tiles are served meanwhile.
+    thread::spawn(move || {
+        loop {
+            match coverage::load_or_compute(
+                &coverage_sources,
+                args.coverage_zoom,
+                args.coverage_full_to,
+                args.coverage_cache.as_deref(),
+            ) {
+                Ok(coverage) => {
+                    let _ = context.coverage.set(coverage);
+
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error computing coverage, retrying in 10 minutes: {e}");
+
+                    thread::sleep(Duration::from_secs(600));
+                }
+            }
+        }
+    });
 
     let listener = TcpListener::bind(args.listen_address).await?;
 
