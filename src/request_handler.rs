@@ -12,7 +12,7 @@ use hyper::{
 use image::{
     DynamicImage, ImageError, ImageReader, Pixel, RgbImage, RgbaImage, imageops::crop_imm,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, io::Cursor, path::Path, sync::Arc};
 use tokio::{runtime::Runtime, task::JoinError};
 use url::Url;
@@ -532,7 +532,7 @@ fn get_tile_data(
     } else {
         source_connections.push(SourceConnection {
             source,
-            connection: Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+            connection: crate::sqlite::open_immutable(source)?,
         });
 
         &source_connections.last().unwrap().connection

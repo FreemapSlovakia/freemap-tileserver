@@ -1,6 +1,7 @@
 mod background;
 mod coverage;
 mod request_handler;
+mod sqlite;
 mod structs;
 
 use anyhow::Result;
@@ -10,7 +11,6 @@ use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use image::Rgba;
 use request_handler::handle_request;
-use rusqlite::{Connection, OpenFlags};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         .source
         .into_iter()
         .map(|source| {
-            let conn = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let conn = sqlite::open_immutable(&source)?;
 
             let limits = conn
                 .query_row(

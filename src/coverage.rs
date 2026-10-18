@@ -1,5 +1,4 @@
 use flate2::{Compression, write::GzEncoder};
-use rusqlite::{Connection, OpenFlags};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -181,7 +180,7 @@ fn compute(sources: &[CoverageSource], zoom: u8, full_to: u8) -> anyhow::Result<
     let mut coarse = vec![HashMap::<(u32, u32), Cover>::new(); zoom as usize];
 
     for source in sources {
-        let conn = Connection::open_with_flags(&source.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = crate::sqlite::open_immutable(&source.path)?;
 
         let Some(source_max) = conn.query_row("SELECT max(zoom_level) FROM tiles", (), |row| {
             row.get::<_, Option<u8>>(0)
